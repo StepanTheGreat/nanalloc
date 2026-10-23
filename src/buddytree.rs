@@ -77,6 +77,28 @@ impl<const S: usize> BuddyTree<S> {
         Some(layer)
     }
 
+    /// Layer-local index of a node
+    pub fn layer_ind(&self, node: usize) -> Option<usize> {
+        if node >= self.nodes() {
+            return None;
+        }
+
+        let layer = self.layer(node)?;
+
+        Some(node - (2usize.pow(layer as u32) - 1))
+    }
+
+    /// Get a node index from its layer and local index within layer
+    pub fn node_from_local(&self, layer: usize, local_ind: usize) -> Option<usize> {
+        let node = (2usize.pow(layer as u32)-1) + local_ind;
+
+        if node >= self.nodes() {
+            return None;
+        }
+
+        Some(node)
+    }
+
     /// Get the total amount of nodes within this tree (excluding the first one)
     pub fn nodes(&self) -> usize {
         S * NODES_PER_PAGE - 1
@@ -423,8 +445,17 @@ mod tests {
 
             // Assert that all those nodes have proper layers
             for (layer_ind, layer) in children_parents.into_iter().enumerate() {
-                for node in layer.iter().copied() {
-                    assert_eq!(bt.layer(node).unwrap(), layer_ind);
+                for (node_ind, node) in layer.iter().copied().enumerate() {
+                    let layer = bt.layer(node).unwrap();
+                    let local_ind = bt.layer_ind(node).unwrap();
+
+                    assert_eq!(layer, layer_ind);
+
+                    // Also test layer-local indices
+                    assert_eq!(local_ind, node_ind);
+
+                    // And we can get back our node from its layer and local index
+                    assert_eq!(bt.node_from_local(layer, local_ind).unwrap(), node);
                 }
             }
         }

@@ -11,9 +11,11 @@
 //! simpler in implementation. Each node is represented as 2 bits (0 - all free, 1 - one free, 2 - none free), packed tightly into 32 bit integers.
 //! The first node entry is zeroed and ignored.  
 
-use core::{alloc::GlobalAlloc, arch::wasm32::{self, memory_size}, cell::Cell, ptr::null_mut};
+use core::{alloc::GlobalAlloc, arch::wasm32::{self, memory_size}, cell::{Cell, RefCell}, ptr::null_mut};
 
-use crate::util::FixedStack;
+use crate::{
+    buddytree::{BuddyNode, BuddyTree, BuddyTreePage}, util::FixedStack
+};
 
 /// The index of wasm memory
 const WASM_MEM_INDEX: u32 = 0;
@@ -31,19 +33,15 @@ const BLOCK_SIZE: usize = PAGE_SIZE/8;
 const TOTAL_BLOCKS: usize = HEAP_SIZE / BLOCK_SIZE;
 
 /// The amount of bitsets we need to store. A single blocks takes 2 bits, since it needs in total 3 values.
-const TOTAL_BLOCK_BITSETS: usize = (TOTAL_BLOCKS * 2).div_ceil(u32::BITS as usize);
+const TOTAL_BLOCK_BITSETS: usize = (TOTAL_BLOCKS * 2).div_ceil(BuddyTreePage::BITS as usize);
 
-/// A block node that supports 3 states and tightly packed as a 2bit integer
-enum BlockNode {
-    BothFree,
-    OneFree,
-    NoneFree
-}
+/// This is a hardcoded value, since log2 isn't const-friendly. Essentially it's just `TOTAL_BLOCKS.log2()+1`
+const TOTAL_TREE_LAYERS: usize = 19;
 
 /// An ultra minimal allocator
 pub struct Allocator {
-    /// The pointer to our block tre
-    block_tree_ptr: Cell<Option<*mut [u32; TOTAL_BLOCK_BITSETS]>>,
+    /// The pointer to our block tree
+    block_tree: RefCell<Option<BuddyTree<TOTAL_BLOCK_BITSETS>>>,
     
     /// The pointer to our usable heap
     heap_ptr: Cell<Option<*mut u8>>,
@@ -58,7 +56,7 @@ pub struct Allocator {
 impl Allocator {
     fn new() -> Self {
         Self {
-            block_tree_ptr: Cell::new(None),
+            block_tree: RefCell::new(None),
             heap_ptr: Cell::new(None),
             pages_allocated: Cell::new(0),
             initialized: Cell::new(false)
@@ -90,14 +88,11 @@ impl Allocator {
         }
 
         if let Some(block_page_ptr) = self.alloc_pages(1) {
-            let block_page_ptr = block_page_ptr as *mut [u32; TOTAL_BLOCK_BITSETS];
+            let block_page_ptr = block_page_ptr as *mut u32;
             let heap_ptr = (memory_size::<0>() * PAGE_SIZE) as *mut u8;
-
-            // Fill everything with zeros
-            unsafe { &mut *block_page_ptr }.fill(0);
             
-            // Set our block tree
-            self.block_tree_ptr.set(Some(block_page_ptr));
+            // Initialize our block tree
+            let _ = self.block_tree.borrow_mut().insert(unsafe { BuddyTree::<TOTAL_BLOCK_BITSETS>::new(block_page_ptr) });
             self.heap_ptr.set(Some(heap_ptr));
         } else {
             return false;
@@ -107,42 +102,104 @@ impl Allocator {
         true
     }
 
-    fn get_node(&self, node: usize) -> Option<BlockNode> {
-        if !self.initialize() {
-            return None;
-        } else if node == 0 || node > TOTAL_BLOCKS {
-            return None
+    /// Prealocate pages to satisfy a block request
+    fn preallocate_pages_for(&self, ptr: *const u8, size: usize) -> Option<()> {
+        let heap_start = self.heap_ptr.get()? as *const u8;
+
+        // Already satisfied
+        if heap_start >= ptr {
+            return Some(());
         }
 
-        let bitset_ind = node / 16;
-        let bit_ind = (node % 16) * 2;
+        // Compute the amount of pages we might need
+        let req_pages = ((ptr as usize + size) - (heap_start as usize)).div_ceil(PAGE_SIZE);
+        if req_pages > 0 {
+            self.alloc_pages(req_pages)?;
+        }
+
+        Some(())
     }
 
-    fn find_block(bytes: usize) -> Option<*mut u8> {
+    /// Find a block that can satisfy the requested amount of bytes 
+    fn find_block(&self, bytes: usize) -> Option<*mut u8> {
         let po2_bytes = bytes.next_power_of_two().max(BLOCK_SIZE);
     
         if po2_bytes > HEAP_SIZE {
             return None;
         } 
 
+        let block_tree_b = self.block_tree.borrow();
+        let block_tree = block_tree_b.as_ref()?;
+
         // A stack of (parent ID, direction to process Some(left = true, false = false))
-        let mut node_stack = FixedStack::new((0usize, Some(true)));
+        let mut node_stack: FixedStack<(usize, Option<bool>), TOTAL_TREE_LAYERS> = FixedStack::new((0usize, Some(true)));
         
-        // 0 node is ignored in our tree
-        node_stack.push((1, Some(true)));
+        node_stack.push((0, Some(true)));
         
         while let Some((node, to_process)) = node_stack.pop() {
+
+            // Whether we're processing left or right child
+            let process_left_child = if let Some(left_child) = to_process {
+                left_child
+            } else {
+                continue;
+            };
             
             // Get the layer of this node in the tree
-            let layer = (node as f32).log2() as usize;
+            let layer = block_tree.layer(node)?;
+            let layer_ind = block_tree.layer_ind(node)?;
 
-            // It's block-size
-            let block_size = 2.pow(31-layer);
+            // The total size of this node
+            let node_size = 2usize.pow(31-layer as u32);
+
+            // Get the node pointer that we can return
+            let node_ptr = unsafe { self.heap_ptr.get()?.add(node_size * layer_ind) };
             
-            if po2_bytes > block_size {
-                
+            let status = block_tree.get(node)?;
+
+            match status {
+                BuddyNode::Full => continue,
+                BuddyNode::Partial => {},
+                BuddyNode::Free => {
+                    if node_size == po2_bytes {
+                        // We found the perfect block - take it!
+                        block_tree.occupy(node);
+                        self.preallocate_pages_for(node_ptr, node_size);
+                        return Some(node_ptr);
+                    }
+                }
             }
+
+            // If we have children - let's push them
+            if let Some((lchild, rchild)) = block_tree.children(node) {
+                // Push ourselves, but now for the right child
+                node_stack.push((node, Some(false)));
+                
+                let child_to_push = if process_left_child { lchild } else { rchild };
+
+                node_stack.push((child_to_push, Some(true)));
+            }
+
         }
+
+        // In any other case we cannot satisfy the request
+        None
+    }
+
+    fn free_block(&self, ptr: *const u8) -> Option<()> {
+        let heap_start = self.heap_ptr.get()? as *const u8;
+
+        if ptr < heap_start {
+            // Our block start earlier than our heap????
+            return None;
+        }
+
+        // No matter which block we take in the tree, there always exists a leaf block with the same position.
+        // Thanks to the way we track taken blocks: we're going to traverse our tree from its bottom to the top; the moment we
+        // encounter an occupied parent - we found the block that was actually taken (children are not marked as occupied when their parents are). 
+        let leaf_block = (ptr as usize) - (heap_start as usize) / BLOCK_SIZE;
+
+        None
     }
 }
 
