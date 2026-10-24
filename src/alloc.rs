@@ -39,7 +39,12 @@ const TOTAL_BLOCK_BITSETS: usize = (TOTAL_BLOCKS * 2).div_ceil(BuddyTreePage::BI
 const TOTAL_TREE_LAYERS: usize = 19;
 
 /// An ultra minimal allocator
-pub struct Allocator {
+/// 
+/// Some properties and quirks:
+/// - Has a maximum heap size of 2^31 bytes
+/// - Allocates memory in blocks of 8192 bytes (1/8 of a single wasm page)
+/// - Only guarantees alignment for up to 8192 bytes (doesn't fail to allocate though).
+pub struct NanAlloc {
     /// The pointer to our block tree
     block_tree: RefCell<Option<BuddyTree<TOTAL_BLOCK_BITSETS>>>,
     
@@ -53,8 +58,16 @@ pub struct Allocator {
     initialized: Cell<bool>
 }
 
-impl Allocator {
-    fn new() -> Self {
+// No threading on wasm
+#[cfg(target_family = "wasm")]
+unsafe impl Sync for NanAlloc {}
+
+// Same thing
+#[cfg(target_family = "wasm")]
+unsafe impl Send for NanAlloc {}
+
+impl NanAlloc {
+    pub const fn new() -> Self {
         Self {
             block_tree: RefCell::new(None),
             heap_ptr: Cell::new(None),
@@ -92,7 +105,9 @@ impl Allocator {
             let heap_ptr = (memory_size::<0>() * PAGE_SIZE) as *mut u8;
             
             // Initialize our block tree
-            let _ = self.block_tree.borrow_mut().insert(unsafe { BuddyTree::<TOTAL_BLOCK_BITSETS>::new(block_page_ptr) });
+            if let Some(mut block_tree) = self.block_tree.try_borrow_mut().ok() {
+                let _ = block_tree.insert(unsafe { BuddyTree::<TOTAL_BLOCK_BITSETS>::new(block_page_ptr) });
+            }
             self.heap_ptr.set(Some(heap_ptr));
         } else {
             return false;
@@ -128,7 +143,7 @@ impl Allocator {
             return None;
         } 
 
-        let block_tree_b = self.block_tree.borrow();
+        let block_tree_b = self.block_tree.try_borrow().ok()?;
         let block_tree = block_tree_b.as_ref()?;
 
         // A stack of (parent ID, direction to process Some(left = true, false = false))
@@ -186,35 +201,58 @@ impl Allocator {
         None
     }
 
-    fn free_block(&self, ptr: *const u8) -> Option<()> {
-        let heap_start = self.heap_ptr.get()? as *const u8;
+    fn free_block(&self, ptr: *mut u8) -> Option<()> {
+        let heap_start = self.heap_ptr.get()?;
 
         if ptr < heap_start {
             // Our block start earlier than our heap????
             return None;
         }
 
+        let block_tree_b = self.block_tree.try_borrow().ok()?;
+        let block_tree = block_tree_b.as_ref()?;
+
         // No matter which block we take in the tree, there always exists a leaf block with the same position.
         // Thanks to the way we track taken blocks: we're going to traverse our tree from its bottom to the top; the moment we
         // encounter an occupied parent - we found the block that was actually taken (children are not marked as occupied when their parents are). 
-        let leaf_block = (ptr as usize) - (heap_start as usize) / BLOCK_SIZE;
+        let leaf_block_ind = ((ptr as usize) - (heap_start as usize)) / BLOCK_SIZE;
 
+        // Find the bottom most leaf node
+        let mut current_node = block_tree.node_from_local(TOTAL_TREE_LAYERS-1, leaf_block_ind);
+
+        while let Some(node) = current_node {
+            let status = block_tree.get(node)?;
+            // That's our node! Free it! 
+            if status == BuddyNode::Full {
+                block_tree.free(node);
+                return Some(());
+            } else {
+                // In any other case get its parent and continue
+                current_node = block_tree.parent(node);
+            }
+        }
+
+        // If there's actually no full parent - that's probably a user bug.
         None
     }
 }
 
-unsafe impl GlobalAlloc for Allocator {
+unsafe impl GlobalAlloc for NanAlloc {
     unsafe fn alloc(&self, layout: core::alloc::Layout) -> *mut u8 {
         if !self.initialize() {
             return null_mut();
         }
 
-        null_mut()
+        // Try find a block or return a null pointer
+        self.find_block(layout.size()).unwrap_or(null_mut())
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: core::alloc::Layout) {
         if !self.initialize() {
             return;
         }
+
+        // Try free the pointer if possible
+        let _ = self.free_block(ptr);
     }
 }

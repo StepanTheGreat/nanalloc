@@ -17,7 +17,7 @@ impl<T: Copy, const S: usize> FixedStack<T, S> {
             return Some(value);
         }
 
-        self.values[self.len] = value;
+        unsafe { *self.values.get_unchecked_mut(self.len) = value };
         self.len += 1;
 
         None
@@ -28,22 +28,9 @@ impl<T: Copy, const S: usize> FixedStack<T, S> {
         if self.len > 0 {
             self.len -= 1;
             
-            Some(self.values[self.len])
+            Some(unsafe { *self.values.get_unchecked(self.len) })
         } else {
             None
         }
-    }
-
-    /// Get the last element on the stack
-    pub fn head(&self) -> Option<T> {
-        if self.len > 0 {
-            Some(self.values[self.len-1])
-        } else {
-            None
-        }
-    }
-
-    pub fn len(&self) -> usize {
-        self.len
     }
 }
