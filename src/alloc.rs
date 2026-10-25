@@ -11,32 +11,35 @@
 //! simpler in implementation. Each node is represented as 2 bits (0 - all free, 1 - one free, 2 - none free), packed tightly into 32 bit integers.
 //! The first node entry is zeroed and ignored.  
 
-use core::{alloc::GlobalAlloc, arch::wasm32::{self, memory_size}, cell::{Cell, RefCell}, ptr::null_mut};
+#[cfg(not(target_arch = "wasm32"))]
+use core::alloc::Layout;
+use core::{alloc::GlobalAlloc, cell::{Cell, OnceCell}, ptr::null_mut};
 
 use crate::{
-    buddytree::{BuddyNode, BuddyTree, BuddyTreePage}, util::FixedStack
+    buddytree::{BuddyNode, BuddyTree, BuddyTreePage}, 
+    util::FixedStack, 
+    wasm::{PAGE_SIZE, memory_grow, memory_size}
 };
-
-/// The index of wasm memory
-const WASM_MEM_INDEX: u32 = 0;
-
-/// The size of a single wasm page
-const PAGE_SIZE: usize = 2usize.pow(16); 
 
 /// The total size of the heap. We're putting here a reasonable constant that both makes our implementation simple, 
 const HEAP_SIZE: usize = 2usize.pow(31);
 
 /// The size of a single allocatable memory block
-const BLOCK_SIZE: usize = PAGE_SIZE/8; 
+const BLOCK_SIZE: usize = PAGE_SIZE/4; 
 
 /// The total amount of blocks
 const TOTAL_BLOCKS: usize = HEAP_SIZE / BLOCK_SIZE;
 
-/// The amount of bitsets we need to store. A single blocks takes 2 bits, since it needs in total 3 values.
-const TOTAL_BLOCK_BITSETS: usize = (TOTAL_BLOCKS * 2).div_ceil(BuddyTreePage::BITS as usize);
+/// How many binary nodes in a tree. The total amount of lead nodes * 2 - 1
+const TOTAL_NODES: usize = TOTAL_BLOCKS*2 - 1;
 
-/// This is a hardcoded value, since log2 isn't const-friendly. Essentially it's just `TOTAL_BLOCKS.log2()+1`
-const TOTAL_TREE_LAYERS: usize = 19;
+/// The amount of bitsets we need to store. A single block takes 2 bits, since it needs in total 3 values.
+/// 
+/// The total amount 
+const TOTAL_BLOCK_BITSETS: usize = (TOTAL_NODES * 2).div_ceil(BuddyTreePage::BITS as usize);
+
+/// This is a hardcoded value, since log2 isn't const-friendly. Essentially it's just `TOTAL_BLOCKS.log2()`
+const TOTAL_TREE_LAYERS: usize = 18;
 
 /// An ultra minimal allocator
 /// 
@@ -46,10 +49,10 @@ const TOTAL_TREE_LAYERS: usize = 19;
 /// - Only guarantees alignment for up to 8192 bytes (doesn't fail to allocate though).
 pub struct NanAlloc {
     /// The pointer to our block tree
-    block_tree: RefCell<Option<BuddyTree<TOTAL_BLOCK_BITSETS>>>,
+    block_tree: OnceCell<BuddyTree<TOTAL_BLOCK_BITSETS>>,
     
     /// The pointer to our usable heap
-    heap_ptr: Cell<Option<*mut u8>>,
+    heap_ptr: OnceCell<*mut u8>,
     
     /// How many pages were already allocated
     pages_allocated: Cell<usize>,
@@ -59,18 +62,18 @@ pub struct NanAlloc {
 }
 
 // No threading on wasm
-#[cfg(target_family = "wasm")]
+#[cfg(target_arch = "wasm32")]
 unsafe impl Sync for NanAlloc {}
 
 // Same thing
-#[cfg(target_family = "wasm")]
+#[cfg(target_arch = "wasm32")]
 unsafe impl Send for NanAlloc {}
 
 impl NanAlloc {
     pub const fn new() -> Self {
         Self {
-            block_tree: RefCell::new(None),
-            heap_ptr: Cell::new(None),
+            block_tree: OnceCell::new(),
+            heap_ptr: OnceCell::new(),
             pages_allocated: Cell::new(0),
             initialized: Cell::new(false)
         }
@@ -82,12 +85,12 @@ impl NanAlloc {
         }
 
         // Make a pointer to the edge 
-        let ptr = (wasm32::memory_size::<WASM_MEM_INDEX>() * PAGE_SIZE) as *mut u8;
+        let ptr = (memory_size() * PAGE_SIZE) as *mut u8;
 
-        // If successful - return a pointer    
-        match wasm32::memory_grow::<WASM_MEM_INDEX>(pages) {
-            usize::MAX => None,
-            _ => {
+        // If successful - return a pointer
+        match memory_grow(pages) {
+            None => None,
+            Some(_) => {
                 self.pages_allocated.set(self.pages_allocated.get() + pages);
                 Some(ptr)
             },
@@ -100,15 +103,21 @@ impl NanAlloc {
             return true;
         }
 
-        if let Some(block_page_ptr) = self.alloc_pages(1) {
-            let block_page_ptr = block_page_ptr as *mut u32;
-            let heap_ptr = (memory_size::<0>() * PAGE_SIZE) as *mut u8;
+        if let Some(block_tree_ptr) = self.alloc_pages(1) {
+
+            // We're doing this for testing purposes ONLY - we need an actual address where 
+            // we can store our metadata.
+            #[cfg(not(target_arch = "wasm32"))]
+            let block_tree_ptr = unsafe {
+                std::alloc::alloc(Layout::from_size_align(PAGE_SIZE, 2).unwrap())
+            };
+
+            let block_tree_ptr = block_tree_ptr as *mut u32;
+            let heap_ptr = (memory_size() * PAGE_SIZE) as *mut u8;
             
             // Initialize our block tree
-            if let Some(mut block_tree) = self.block_tree.try_borrow_mut().ok() {
-                let _ = block_tree.insert(unsafe { BuddyTree::<TOTAL_BLOCK_BITSETS>::new(block_page_ptr) });
-            }
-            self.heap_ptr.set(Some(heap_ptr));
+            let _ = self.block_tree.set(unsafe { BuddyTree::<TOTAL_BLOCK_BITSETS>::new(block_tree_ptr) });
+            let _ = self.heap_ptr.set(heap_ptr);
         } else {
             return false;
         }
@@ -119,7 +128,7 @@ impl NanAlloc {
 
     /// Prealocate pages to satisfy a block request
     fn preallocate_pages_for(&self, ptr: *const u8, size: usize) -> Option<()> {
-        let heap_start = self.heap_ptr.get()? as *const u8;
+        let heap_start = self.heap_ptr.get().copied()? as *const u8;
 
         // Already satisfied
         if heap_start >= ptr {
@@ -143,8 +152,7 @@ impl NanAlloc {
             return None;
         } 
 
-        let block_tree_b = self.block_tree.try_borrow().ok()?;
-        let block_tree = block_tree_b.as_ref()?;
+        let block_tree = self.block_tree.get()?;
 
         // A stack of (parent ID, direction to process Some(left = true, false = false))
         let mut node_stack: FixedStack<(usize, Option<bool>), TOTAL_TREE_LAYERS> = FixedStack::new((0usize, Some(true)));
@@ -169,10 +177,8 @@ impl NanAlloc {
 
             // Get the node pointer that we can return
             let node_ptr = unsafe { self.heap_ptr.get()?.add(node_size * layer_ind) };
-            
-            let status = block_tree.get(node)?;
 
-            match status {
+            match block_tree.get(node)? {
                 BuddyNode::Full => continue,
                 BuddyNode::Partial => {},
                 BuddyNode::Free => {
@@ -187,11 +193,14 @@ impl NanAlloc {
 
             // If we have children - let's push them
             if let Some((lchild, rchild)) = block_tree.children(node) {
-                // Push ourselves, but now for the right child
-                node_stack.push((node, Some(false)));
                 
+                // Which child to push
                 let child_to_push = if process_left_child { lchild } else { rchild };
-
+                
+                // Push ourselves once more, but now for the right child
+                node_stack.push((node, if process_left_child { Some(false) } else { None }));
+                
+                // Push our child
                 node_stack.push((child_to_push, Some(true)));
             }
 
@@ -202,15 +211,14 @@ impl NanAlloc {
     }
 
     fn free_block(&self, ptr: *mut u8) -> Option<()> {
-        let heap_start = self.heap_ptr.get()?;
+        let heap_start = self.heap_ptr.get().copied()?;
 
         if ptr < heap_start {
             // Our block start earlier than our heap????
             return None;
         }
 
-        let block_tree_b = self.block_tree.try_borrow().ok()?;
-        let block_tree = block_tree_b.as_ref()?;
+        let block_tree = self.block_tree.get()?;
 
         // No matter which block we take in the tree, there always exists a leaf block with the same position.
         // Thanks to the way we track taken blocks: we're going to traverse our tree from its bottom to the top; the moment we
@@ -219,6 +227,7 @@ impl NanAlloc {
 
         // Find the bottom most leaf node
         let mut current_node = block_tree.node_from_local(TOTAL_TREE_LAYERS-1, leaf_block_ind);
+
 
         while let Some(node) = current_node {
             let status = block_tree.get(node)?;
@@ -254,5 +263,69 @@ unsafe impl GlobalAlloc for NanAlloc {
 
         // Try free the pointer if possible
         let _ = self.free_block(ptr);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{NanAlloc, alloc::{BLOCK_SIZE, TOTAL_BLOCKS}};
+    use core::{alloc::{GlobalAlloc, Layout}, ptr::null_mut};
+
+    macro_rules! init_alloc {
+        () => {
+            struct NanAllocSync(NanAlloc);
+
+            unsafe impl Send for NanAllocSync {}
+            unsafe impl Sync for NanAllocSync {}
+
+            static ALLOC: NanAllocSync = NanAllocSync(NanAlloc::new());
+
+            // Utility functions
+
+            unsafe fn alloc(size: usize) -> *mut u8 {
+                unsafe { 
+                    ALLOC.0.alloc(Layout::from_size_align(size, 2).unwrap())
+                }
+            }
+
+            unsafe fn dealloc(ptr: *mut u8) {
+                unsafe { 
+                    ALLOC.0.dealloc(ptr, Layout::from_size_align(2, 2).unwrap())
+                }
+            }       
+        };
+    }
+
+    /// Test basic allocator functionality
+    #[test]
+    fn test_basic_alloc() {
+        init_alloc!();
+
+        // We're going to allocate all of the blocks within our entire heap. Individually.
+        let mut block_ptrs = std::vec![null_mut::<u8>(); TOTAL_BLOCKS];
+
+        // This experiment is then repeated multiple times for stability.
+        for _ in 0..4 {
+
+            // Allocate EACH block from the heap
+            for bind in 0..TOTAL_BLOCKS {
+                block_ptrs[bind] = unsafe { alloc(BLOCK_SIZE) };
+    
+                // This pointer cannot be null!
+                assert!(!block_ptrs[bind].is_null());
+            }
+
+            // We no longer have any more blocks
+            assert!(unsafe { alloc(BLOCK_SIZE) }.is_null());
+
+            // Let's free all of them now
+            for bind in 0..TOTAL_BLOCKS {
+                unsafe { dealloc(block_ptrs[bind]) };
+            }
+
+            // Zero all our pointers
+            block_ptrs.fill(null_mut());
+        }
+        
     }
 }

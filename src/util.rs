@@ -17,7 +17,9 @@ impl<T: Copy, const S: usize> FixedStack<T, S> {
             return Some(value);
         }
 
-        unsafe { *self.values.get_unchecked_mut(self.len) = value };
+        if let Some(item) = self.values.get_mut(self.len) {
+            *item = value;
+        }
         self.len += 1;
 
         None
@@ -28,7 +30,7 @@ impl<T: Copy, const S: usize> FixedStack<T, S> {
         if self.len > 0 {
             self.len -= 1;
             
-            Some(unsafe { *self.values.get_unchecked(self.len) })
+            self.values.get(self.len).copied()
         } else {
             None
         }

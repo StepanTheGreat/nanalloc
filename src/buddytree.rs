@@ -57,9 +57,7 @@ impl<const S: usize> BuddyTree<S> {
 
     /// Clear this bit tree (fill with zeros)
     pub fn clear(&self) {
-        for i in 0..S {
-            unsafe { (self.ptr.add(i)).write(0) };
-        }
+        unsafe { self.ptr.write_bytes(0, S) };
     }
 
     /// Get layer of a node. The root layer is 0. 

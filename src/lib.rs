@@ -1,16 +1,15 @@
-#![no_std]
-#![no_main]
+#![cfg_attr(target_arch = "wasm32", no_std)]
 
+#[cfg(not(target_arch = "wasm32"))]
+extern crate std;
+
+mod wasm;
 mod buddytree;
-
 mod util;
-
-#[cfg(target_family = "wasm")]
 mod alloc;
-
-#[cfg(target_family = "wasm")]
 pub use alloc::NanAlloc;
 
+#[cfg(target_arch = "wasm32")]
 #[panic_handler]
 fn _panic_handler(_info: &core::panic::PanicInfo<'_>) -> ! {
     loop {}
