@@ -12,7 +12,6 @@
 //! The first node entry is zeroed and ignored.  
 
 #[cfg(not(target_arch = "wasm32"))]
-use core::alloc::Layout;
 use core::{alloc::GlobalAlloc, cell::{Cell, OnceCell}, ptr::null_mut};
 
 use crate::{
@@ -22,10 +21,10 @@ use crate::{
 };
 
 /// The total size of the heap. We're putting here a reasonable constant that both makes our implementation simple, 
-const HEAP_SIZE: usize = 2usize.pow(31);
+const HEAP_SIZE: usize = 2usize.pow(30);
 
 /// The size of a single allocatable memory block
-const BLOCK_SIZE: usize = PAGE_SIZE/4; 
+const BLOCK_SIZE: usize = PAGE_SIZE/8; 
 
 /// The total amount of blocks
 const TOTAL_BLOCKS: usize = HEAP_SIZE / BLOCK_SIZE;
@@ -104,14 +103,6 @@ impl NanAlloc {
         }
 
         if let Some(block_tree_ptr) = self.alloc_pages(1) {
-
-            // We're doing this for testing purposes ONLY - we need an actual address where 
-            // we can store our metadata.
-            #[cfg(not(target_arch = "wasm32"))]
-            let block_tree_ptr = unsafe {
-                std::alloc::alloc(Layout::from_size_align(PAGE_SIZE, 2).unwrap())
-            };
-
             let block_tree_ptr = block_tree_ptr as *mut u32;
             let heap_ptr = (memory_size() * PAGE_SIZE) as *mut u8;
             
@@ -173,7 +164,7 @@ impl NanAlloc {
             let layer_ind = block_tree.layer_ind(node)?;
 
             // The total size of this node
-            let node_size = 2usize.pow(31-layer as u32);
+            let node_size = 2usize.pow(30-layer as u32);
 
             // Get the node pointer that we can return
             let node_ptr = unsafe { self.heap_ptr.get()?.add(node_size * layer_ind) };
