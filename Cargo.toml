@@ -3,6 +3,10 @@ name = "nanalloc"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+size_test = []
+default = []
+
 [lib]
 crate-type = ["rlib", "cdylib"]
 
@@ -13,7 +17,7 @@ panic = "abort"
 [profile.release]
 overflow-checks = false
 strip = true
-opt-level = "z"
+opt-level = "s"
 lto = true
 codegen-units = 1
 panic = "abort"
