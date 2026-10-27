@@ -19,6 +19,8 @@ use crate::{
     wasm::{PAGE_SIZE, memory_grow, memory_size}
 };
 
+mod pool;
+
 /// The total size of the heap. We're putting here a reasonable constant that both makes our implementation simple, 
 const HEAP_SIZE: usize = 2usize.pow(30);
 
