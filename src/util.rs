@@ -1,5 +1,3 @@
-use core::cell::{Cell, UnsafeCell};
-
 pub struct FixedStack<T: Copy, const S: usize,> {
     values: [T; S],
     len: usize

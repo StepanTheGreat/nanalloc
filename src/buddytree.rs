@@ -108,7 +108,7 @@ impl<const S: usize> BuddyTree<S> {
             return None;
         }
 
-        let parent = ((ind - 1) as f32 / 2.0) as usize;
+        let parent = (ind - 1) / 2;
 
         Some(parent)
     }
@@ -155,8 +155,7 @@ impl<const S: usize> BuddyTree<S> {
         Some(match node {
             0 => BuddyNode::Free,
             1 => BuddyNode::Full,
-            2 => BuddyNode::Partial,
-            _ => return None
+            _ => BuddyNode::Partial,
         })
     }
 
@@ -182,8 +181,7 @@ impl<const S: usize> BuddyTree<S> {
         // 4. Write it back
 
         let page = unsafe { self.ptr.add(page_ind).read() };
-        let page = page & value_mask;
-        let page = page | value;
+        let page = (page & value_mask) | value;
 
         unsafe { self.ptr.add(page_ind).write(page) };
     }

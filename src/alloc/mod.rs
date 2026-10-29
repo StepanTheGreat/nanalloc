@@ -303,7 +303,7 @@ unsafe impl GlobalAlloc for NanAlloc {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use crate::{NanAlloc, alloc::{BLOCK_SIZE, HEAP_SIZE, TOTAL_BLOCKS, TOTAL_TREE_LAYERS}};
     use core::{alloc::Layout, ptr::null_mut};
