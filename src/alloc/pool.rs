@@ -34,6 +34,9 @@ pub struct ClassPool {
     /// Pointer to the next pool (if not null)
     next_pool: *mut ClassPool,
 
+    /// Pointer to the previous pool. Used for freeing full class pools
+    prev_pool: *mut ClassPool,
+
     /// Pointer to the pool list
     pool_list: *mut ClassPoolList,
 
@@ -49,6 +52,7 @@ impl ClassPool {
         block_ptr: *mut u8, 
         pool_list: *mut ClassPoolList,
         next_pool: *mut ClassPool, 
+        prev_pool: *mut ClassPool,
         chunk_size: usize
     ) -> Option<Self> {
         if !chunk_size.is_power_of_two() {
@@ -56,23 +60,27 @@ impl ClassPool {
         } else if chunk_size < MIN_POOL_CHUNK_SIZE {
             return None;
         }
-
-        let available_chunks = (BLOCK_SIZE / chunk_size) - 1;
         
         let mut this = Self {
             chunk_size,
             next_chunk: null_mut(),
             next_pool,
+            prev_pool, 
             pool_list,
-            available_chunks
+            available_chunks: 0
         };
 
-        // Initialize everything
+        // Build up a list of available chunks
         for ind in 1..(BLOCK_SIZE/chunk_size) {
             unsafe { this.free_chunk(block_ptr.add(ind*chunk_size)) };
         }
 
         Some(this)
+    }
+
+    /// How many chunks a pool of the provided chunk size can contain 
+    pub fn pool_chunk_capacity(chunk_size: usize) -> usize {
+        (BLOCK_SIZE / chunk_size) - 1
     }
 
     pub fn chunk_size(&self) -> usize {
@@ -90,7 +98,20 @@ impl ClassPool {
 
     /// Is our entire pool fully free?
     pub fn is_fully_free(&self) -> bool {
-        self.available_chunks == self.total_available_chunks() 
+        self.available_chunks == Self::pool_chunk_capacity(self.chunk_size) 
+    }
+
+    /// A pool can be freed if:
+    /// 1. It's full free (no actively borrowed memory)
+    /// 2. The total amount of free chunks within the list is greater than of 2 free pools (exlcuding ours that means 1 free pool worth of chunks)
+    /// 
+    /// The primary idea behind this is simple: too many free pools only take up blocks. We should at least
+    /// keep 1 for quick allocation, but anything else isn't neccessary.
+    pub fn can_be_freed(&self) -> bool {
+        let list_chunks = unsafe { (*self.pool_list).total_available_chunks };
+
+        self.is_fully_free() && 
+            list_chunks >= Self::pool_chunk_capacity(self.chunk_size)*2
     }
 
     /// Free this chunk and add it to the chain
@@ -100,7 +121,10 @@ impl ClassPool {
     unsafe fn free_chunk(&mut self, chunk: *mut u8) {
         unsafe { (chunk as *mut *mut u8).write(self.next_chunk) };
         self.next_chunk = chunk;
+
+        // Make sure to update both our and pool's total available chunk count
         self.available_chunks += 1;
+        unsafe { (*self.pool_list).total_available_chunks += 1 };
     }
 
     /// Take the next chunk from the linked list if one is present
@@ -118,18 +142,59 @@ impl ClassPool {
             let current_chunk = self.next_chunk;
             let next_chunk = unsafe {(current_chunk as *mut *mut u8).read()};
             self.next_chunk = next_chunk;
+
+            // Update the total 
             self.available_chunks -= 1;
+            unsafe { (*self.pool_list).total_available_chunks -= 1 };
+
+
+            if !self.has_available_chunk() {
+                unsafe { self.try_unlink(); }
+            }
 
             Some(current_chunk)
         } else {
             None
         }
     }
+
+    /// Unlink itself from the list, until we get back our chunks. Should ONLY happen when there are no more available chunks
+    unsafe fn try_unlink(&mut self) {
+        if self.has_available_chunk() {
+            return;
+        }
+
+        // We'll imagine the following setup (ptr2 is our pool):
+        // <-- ptr1 <--> ptr2 <--> ptr3 -->
+
+        // First link our left pool to our right
+        if !self.prev_pool.is_null() {
+            unsafe { (*self.prev_pool).next_pool = self.next_pool };
+            self.prev_pool = null_mut();
+        }
+
+        // Then link our right pool to our left
+        if !self.next_pool.is_null() {
+            unsafe { (*self.next_pool).prev_pool = self.prev_pool };
+            self.next_pool = null_mut();
+        }
+
+        // TODO: Unlink from the list root
+
+        // We now got the following
+        // <-- ptr1 <--> ptr3 -->
+    }
 }
 
 /// A class pool pointers used to reference pools
 pub struct ClassPoolList {
+    /// The size of the chunk for that list
     chunk_size: usize,
+
+    /// The total sum of available chunks within this list
+    total_available_chunks: usize,
+    
+    /// The pointer to the first pool
     root_pool: *mut ClassPool
 }
 
@@ -143,27 +208,35 @@ impl ClassPoolList {
 
         Some(Self {
             chunk_size,
-            root_pool: null_mut()
+            root_pool: null_mut(),
+            total_available_chunks: 0
         })
     }
 
+    /// Add back an existing pool to the chain. This 
     fn add_pool(&'static mut self, pool: *mut ClassPool) {
-
+        
     }
 
-    /// Add a new pool to the chain
+    /// Allocate a new pool to the chain. When there are no more available chunks
     fn add_new_pool(&'static mut self, alloc: &NanAlloc) -> Option<()> {
         // Find a free single block
         let pool_ptr = alloc.find_block(BLOCK_SIZE)? as *mut ClassPool;
+
+        // If we had a pool before - we're going to shift it to the right
+        if !self.root_pool.is_null() {
+            unsafe { (*self.root_pool).prev_pool = pool_ptr };
+        }
 
         // Create a write our new pool directly into the block
         unsafe {
             pool_ptr.write(ClassPool::new(
                 pool_ptr as *mut u8, 
                 self as *mut ClassPoolList,
-                self.root_pool, 
-                self.chunk_size) 
-            ?);
+                self.root_pool,
+                null_mut(), 
+                self.chunk_size
+            )?);
         }
 
         // Add it to our chain

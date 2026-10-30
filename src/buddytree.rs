@@ -155,7 +155,8 @@ impl<const S: usize> BuddyTree<S> {
         Some(match node {
             0 => BuddyNode::Free,
             1 => BuddyNode::Full,
-            _ => BuddyNode::Partial,
+            2 => BuddyNode::Partial,
+            _ => return None,
         })
     }
 

@@ -142,15 +142,22 @@ impl NanAlloc {
 
     /// Prealocate pages to satisfy a block request
     fn preallocate_pages_for(&self, ptr: *const u8, size: usize) -> Option<()> {
-        let heap_start = self.heap_ptr.get().copied()? as *const u8;
+        let required_end = ptr as usize + size;
 
+        // Compute the total allocated end
+        let allocated_end = {
+            let heap_start = self.heap_ptr.get().copied()?;
+
+            heap_start as usize + self.pages_allocated.get() * PAGE_SIZE
+        };
+        
         // Already satisfied
-        if heap_start >= ptr {
-            return Some(());
+        if required_end < allocated_end {
+            return Some(())
         }
 
         // Compute the amount of pages we might need
-        let req_pages = ((ptr as usize + size) - (heap_start as usize)).div_ceil(PAGE_SIZE);
+        let req_pages = (required_end - allocated_end).div_ceil(PAGE_SIZE);
         if req_pages > 0 {
             self.alloc_pages(req_pages)?;
         }
@@ -197,11 +204,15 @@ impl NanAlloc {
                 BuddyNode::Full => continue,
                 BuddyNode::Partial => {},
                 BuddyNode::Free => {
+
+                    // We found the perfect block
                     if node_size == po2_bytes {
-                        // We found the perfect block - take it!
-                        block_tree.occupy(node);
-                        self.preallocate_pages_for(node_ptr, node_size);
-                        return Some(node_ptr);
+                        
+                        // Let's try to preallocate pages for it first. If this operation fails - we cannot procede.
+                        if self.preallocate_pages_for(node_ptr, node_size).is_some() {
+                            block_tree.occupy(node);
+                            return Some(node_ptr);
+                        }
                     }
                 }
             }
@@ -305,61 +316,55 @@ unsafe impl GlobalAlloc for NanAlloc {
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
-    use crate::{NanAlloc, alloc::{BLOCK_SIZE, HEAP_SIZE, TOTAL_BLOCKS, TOTAL_TREE_LAYERS}};
+    use crate::{NanAlloc, alloc::{BLOCK_SIZE}, wasm::{PAGE_SIZE, TEST_MAX_HEAP_PAGES}};
     use core::{alloc::Layout, ptr::null_mut};
 
-    // This macro only serves as a utility for tests. For each test we'll create a separate
-    // static with a Send+Sync implementation. Why? Due to thread safe.
-    macro_rules! init_alloc {
-        () => {
-            struct NanAllocSync(NanAlloc);
+    /// Because we cannot sacrifice 1GB of RAM for our tests
+    const LOCAL_HEAP_SIZE: usize = TEST_MAX_HEAP_PAGES * PAGE_SIZE;
 
-            unsafe impl Send for NanAllocSync {}
-            unsafe impl Sync for NanAllocSync {}
+    const LOCAL_TOTAL_BLOCKS: usize = LOCAL_HEAP_SIZE / BLOCK_SIZE;
 
-            static ALLOC: NanAllocSync = NanAllocSync(NanAlloc::new());
+    /// How many local tree layers we got
+    const LOCAL_TOTAL_TREE_LAYERS: usize = (BLOCK_SIZE.leading_zeros()-LOCAL_HEAP_SIZE.leading_zeros()+1) as usize;
 
-            // Utility functions
-
-            unsafe fn alloc(size: usize, align: usize) -> Option<*mut u8> {
-                unsafe { 
-                    ALLOC.0.ex_alloc(Layout::from_size_align(size, align).unwrap())
-                }
-            }
-
-            unsafe fn dealloc(ptr: *mut u8, size: usize, align: usize) -> Option<()> {
-                unsafe { 
-                    ALLOC.0.ex_dealloc(ptr, Layout::from_size_align(size, align).unwrap())
-                }
-            }       
-        };
+    thread_local! {
+        static ALLOC: NanAlloc = NanAlloc::new();
     }
+
+    unsafe fn alloc(size: usize, align: usize) -> Option<*mut u8> {
+        unsafe { 
+            ALLOC.with(|a| a.ex_alloc(Layout::from_size_align(size, align).unwrap()))
+        }
+    }
+
+    unsafe fn dealloc(ptr: *mut u8, size: usize, align: usize) -> Option<()> {
+        unsafe { 
+            ALLOC.with(|a| a.ex_dealloc(ptr, Layout::from_size_align(size, align).unwrap()))
+        }
+    }      
 
     /// Test basic allocator functionality
     #[test]
     fn test_basic_alloc() {
-        init_alloc!();
-
         // We're going to allocate all of the blocks within our entire heap. Individually.
-        let mut block_ptrs = std::vec![(null_mut::<u8>(), 0); TOTAL_BLOCKS];
+        let mut block_ptrs = std::vec![(null_mut::<u8>(), 0); LOCAL_TOTAL_BLOCKS];
 
         // This experiment is then repeated multiple times for stability.
         for _ in 0..4 {
-
             // Allocate EACH block from the heap
-            for bind in 0..TOTAL_BLOCKS {
+            for bind in 0..LOCAL_TOTAL_BLOCKS {
                 // This pointer cannot be null!
                 block_ptrs[bind] = (
                     unsafe { alloc(BLOCK_SIZE, 1) }.unwrap(), 
                     BLOCK_SIZE
-                );    
+                );
             }
 
             // We no longer have any more blocks
             assert!(unsafe { alloc(BLOCK_SIZE, 1) }.is_none());
 
             // Let's free all of them now
-            for bind in 0..TOTAL_BLOCKS {
+            for bind in 0..LOCAL_TOTAL_BLOCKS {
                 unsafe { dealloc(block_ptrs[bind].0, block_ptrs[bind].1, 1) }.unwrap();
             }
 
@@ -368,7 +373,7 @@ mod tests {
         }
 
         // We'll take all blocks again
-        for bind in 0..TOTAL_BLOCKS {
+        for bind in 0..LOCAL_TOTAL_BLOCKS {
             // This pointer cannot be null!
             block_ptrs[bind] = (
                 unsafe { alloc(BLOCK_SIZE, 1) }.unwrap(), 
@@ -395,28 +400,27 @@ mod tests {
         assert!(unsafe { alloc(BLOCK_SIZE*2, 1) }.is_none());
 
         // Deallocate all our blocks again
-        for bind in 0..TOTAL_BLOCKS {
+        for bind in 0..LOCAL_TOTAL_BLOCKS {
             if !block_ptrs[bind].0.is_null() {
                 unsafe { dealloc(block_ptrs[bind].0, block_ptrs[bind].1, 1) }.unwrap();
             }
         }
+
         block_ptrs.fill((null_mut(), 0));
     }
 
     /// Test various allocator properties
     #[test]
     fn test_alloc_props() {
-        init_alloc!();
-
         // Let's test alignment first
 
         // The maximum allocatable amount is equal to our heap
-        assert!(unsafe { alloc(HEAP_SIZE+1, BLOCK_SIZE*2) }.is_none());
+        assert!(unsafe { alloc(LOCAL_HEAP_SIZE+1, BLOCK_SIZE*2) }.is_none());
 
         // This however will work perfectly fine
         unsafe {
-            let ptr = alloc(HEAP_SIZE, BLOCK_SIZE).unwrap();
-            dealloc(ptr, HEAP_SIZE, BLOCK_SIZE).unwrap();
+            let ptr = alloc(LOCAL_HEAP_SIZE, BLOCK_SIZE).unwrap();
+            dealloc(ptr, LOCAL_HEAP_SIZE, BLOCK_SIZE).unwrap();
         }
 
         // Will fail, since our allocator only guarantees layout up to 8KB
@@ -427,8 +431,6 @@ mod tests {
             let ptr = alloc(BLOCK_SIZE, BLOCK_SIZE).unwrap();
             dealloc(ptr, BLOCK_SIZE, BLOCK_SIZE).unwrap();
         }
-
-
     }
 
     /// We're going to split our tree into two parts:
@@ -438,20 +440,18 @@ mod tests {
     /// The allocator should easily handle various sizes
     #[test]
     fn test_recursive_alloc() {
-        init_alloc!();
-
         let mut left = Vec::new();
         let mut right = Vec::new();
 
         let mut layer_left = 0;
-        let mut layer_right = TOTAL_TREE_LAYERS as u32-2;
+        let mut layer_right = LOCAL_TOTAL_TREE_LAYERS as u32-2;
 
         loop {
-            let block_size_left = BLOCK_SIZE * 2usize.pow((TOTAL_TREE_LAYERS as u32-2)-layer_left);
-            let block_size_right = BLOCK_SIZE * 2usize.pow((TOTAL_TREE_LAYERS as u32-2)-layer_right);
+            let block_size_left = BLOCK_SIZE * 2usize.pow((LOCAL_TOTAL_TREE_LAYERS as u32-2)-layer_left);
+            let block_size_right = BLOCK_SIZE * 2usize.pow((LOCAL_TOTAL_TREE_LAYERS as u32-2)-layer_right);
 
-            let blocks_left = (HEAP_SIZE/2)/block_size_left;
-            let blocks_right = (HEAP_SIZE/2)/block_size_right;
+            let blocks_left = (LOCAL_HEAP_SIZE/2)/block_size_left;
+            let blocks_right = (LOCAL_HEAP_SIZE/2)/block_size_right;
 
             // Allocate the entire left part
             for _ in 0..blocks_left {
