@@ -1,6 +1,6 @@
 use core::ptr::null_mut;
 
-use crate::{NanAlloc, alloc::BLOCK_SIZE};
+use crate::{NanAlloc, alloc::{BLOCK_SIZE, get_block_ptr, is_block_aligned}};
 
 /// The minimum size of a chunk within a pool. This requirement exists because
 /// class pools live at the start of a block, hence they consume at least a single block. 
@@ -45,35 +45,33 @@ pub struct ClassPool {
 }
 
 impl ClassPool {
-    /// Create a new class pool from the provided block pointer and chunk size
-    /// 
-    /// This requires that the chunk size is power of two and >= [MIN_POOL_CHUNK_SIZE]
-    unsafe fn new(
-        block_ptr: *mut u8, 
-        pool_list: *mut ClassPoolList,
-        next_pool: *mut ClassPool, 
-        prev_pool: *mut ClassPool,
-        chunk_size: usize
-    ) -> Option<Self> {
-        if !chunk_size.is_power_of_two() {
-            return None;
-        } else if chunk_size < MIN_POOL_CHUNK_SIZE {
-            return None;
-        }
-        
-        let mut this = Self {
-            chunk_size,
-            next_chunk: null_mut(),
-            next_pool,
-            prev_pool, 
-            pool_list,
-            available_chunks: 0
-        };
+    /// Allocate a new class pool from the provided pool list. Can fail if the allocator fails to find a block.
+    unsafe fn alloc(alloc: &NanAlloc, pool_list: *mut ClassPoolList) -> Option<*mut Self> {
+        let block_ptr = alloc.find_block(BLOCK_SIZE)?;
 
-        // Build up a list of available chunks
+        let pool_ptr = block_ptr as *mut ClassPool;
+
+        let chunk_size = unsafe { (*pool_list).chunk_size };
+
+        // Create our pool and write itself into our newly allocated block
+        unsafe { pool_ptr.write(Self {
+            next_chunk: null_mut(),
+            next_pool: null_mut(),
+            prev_pool: null_mut(), 
+            pool_list,
+            chunk_size,
+            available_chunks: 0,
+        }) };
+
+        // We'll be referring to it by pointer
+        let this = pool_ptr;
+
+        // Build up a list of available chunks for it (starting from 1, because the first one contains our metadata)
         for ind in 1..(BLOCK_SIZE/chunk_size) {
-            unsafe { this.free_chunk(block_ptr.add(ind*chunk_size)) };
+            unsafe { (*this).free_chunk(alloc, block_ptr.add(ind*chunk_size)) };
         }
+
+        // The former step will automatically link our pool 
 
         Some(this)
     }
@@ -114,23 +112,35 @@ impl ClassPool {
             list_chunks >= Self::pool_chunk_capacity(self.chunk_size)*2
     }
 
-    /// Free this chunk and add it to the chain
+    /// Free this chunk and add it to the pool's chain. Internally this will also check if the entire list's capacity
+    /// is not too large to keep this pool. If this pool is fully free (no references to its chunks) and the list has enough chunks from other
+    /// pools - this one and its block will get freed.
     /// 
     /// # Safety
     /// The passed chunk pointer is read as is it is, ONLY the pointer returned by the class pool can be passed back.
-    unsafe fn free_chunk(&mut self, chunk: *mut u8) {
+    unsafe fn free_chunk(&mut self, alloc: &NanAlloc, chunk: *mut u8) {
         unsafe { (chunk as *mut *mut u8).write(self.next_chunk) };
         self.next_chunk = chunk;
+
+        // If we didn't have any chunks - then our pool was unlinked
+        if !self.has_available_chunk() {
+            unsafe { self.relink() };
+        }
 
         // Make sure to update both our and pool's total available chunk count
         self.available_chunks += 1;
         unsafe { (*self.pool_list).total_available_chunks += 1 };
+
+        // In case this pool becomes useless weight - unlink it
+        if self.can_be_freed() {
+            unsafe { self.unlink_free(alloc) };
+        }
     }
 
-    /// Take the next chunk from the linked list if one is present
+    /// Take the next chunk from the linked list if one is present. If there are no more 
+    /// chunks - will automatically unlink itself (not free, only temporarily unlink).
     /// 
     /// # Safety
-    /// 
     unsafe fn take_chunk(&mut self) -> Option<*mut u8> {
 
         // ptr3 -> ptr2 -> ptr1 -> null
@@ -147,9 +157,9 @@ impl ClassPool {
             self.available_chunks -= 1;
             unsafe { (*self.pool_list).total_available_chunks -= 1 };
 
-
+            // If we're out of chunks - unlink
             if !self.has_available_chunk() {
-                unsafe { self.try_unlink(); }
+                unsafe { self.unlink(); }
             }
 
             Some(current_chunk)
@@ -158,14 +168,20 @@ impl ClassPool {
         }
     }
 
-    /// Unlink itself from the list, until we get back our chunks. Should ONLY happen when there are no more available chunks
-    unsafe fn try_unlink(&mut self) {
-        if self.has_available_chunk() {
-            return;
-        }
-
+    /// Unlink itself from the list, until we get back our chunks. Should ONLY happen when there are no more available chunks.
+    /// 
+    /// # Safety
+    /// Should ONLY Be called when the pool was linked and it lost its final chunk 
+    unsafe fn unlink(&mut self) {
         // We'll imagine the following setup (ptr2 is our pool):
         // <-- ptr1 <--> ptr2 <--> ptr3 -->
+
+        // If our pool directly points to us - point it to our next pool
+        {
+            if (unsafe { (*self.pool_list).root_pool }) == self as *mut Self {
+                unsafe { (*self.pool_list).root_pool = self.next_pool };
+            } 
+        }
 
         // First link our left pool to our right
         if !self.prev_pool.is_null() {
@@ -179,10 +195,29 @@ impl ClassPool {
             self.next_pool = null_mut();
         }
 
-        // TODO: Unlink from the list root
-
         // We now got the following
         // <-- ptr1 <--> ptr3 -->
+    }
+
+    /// Link this pool back to the list
+    /// 
+    /// # Safety
+    /// Should ONLY be called when the pool was unlinked and it got a chunk. 
+    unsafe fn relink(&mut self) {
+        self.prev_pool = null_mut();
+        self.next_pool = unsafe { (*self.pool_list).root_pool };
+        unsafe { (*self.pool_list).root_pool = self as *mut Self };
+    }
+
+    /// Unlink and free this pool.
+    /// 
+    /// # Safety 
+    /// Similar to [unlink]
+    unsafe fn unlink_free(&mut self, alloc: &NanAlloc) {
+        unsafe { self.unlink() };
+
+        let block_ptr = self as *mut Self as *mut u8;
+        let _ = alloc.free_block(block_ptr, BLOCK_SIZE);
     }
 }
 
@@ -213,35 +248,61 @@ impl ClassPoolList {
         })
     }
 
-    /// Add back an existing pool to the chain. This 
-    fn add_pool(&'static mut self, pool: *mut ClassPool) {
+    /// Take a chunk if possible (can fail if the allocator cannot provide any more blocks)
+    pub unsafe fn take_chunk(this: *mut Self, alloc: &NanAlloc) -> Option<*mut u8> {
         
+        unsafe {
+            // If no pool is available - create a new one
+            if (*this).root_pool.is_null() {
+                (*this).root_pool = ClassPool::alloc(alloc, this)?;
+            }
+    
+            (*(*this).root_pool).take_chunk()
+        }
     }
 
-    /// Allocate a new pool to the chain. When there are no more available chunks
-    fn add_new_pool(&'static mut self, alloc: &NanAlloc) -> Option<()> {
-        // Find a free single block
-        let pool_ptr = alloc.find_block(BLOCK_SIZE)? as *mut ClassPool;
-
-        // If we had a pool before - we're going to shift it to the right
-        if !self.root_pool.is_null() {
-            unsafe { (*self.root_pool).prev_pool = pool_ptr };
+    /// Free this chunk from the provided block.
+    /// 
+    /// # Safety
+    /// Only non-block aligned pointers can be freed as chunks. The reason: pool chunks are never block aliged, which is a good 
+    /// way to tell if a pointer is a pool or a block pointer.
+    pub unsafe fn free_chunk(alloc: &NanAlloc, chunk: *mut u8) {
+        if !is_block_aligned(chunk) {
+            return;
         }
 
-        // Create a write our new pool directly into the block
         unsafe {
-            pool_ptr.write(ClassPool::new(
-                pool_ptr as *mut u8, 
-                self as *mut ClassPoolList,
-                self.root_pool,
-                null_mut(), 
-                self.chunk_size
-            )?);
+            // Get our pool pointer
+            let pool_ptr = get_block_ptr(chunk) as *mut ClassPool;
+
+            // Free out chunk
+            (*pool_ptr).free_chunk(alloc, chunk);
         }
+    }
+}
 
-        // Add it to our chain
-        self.root_pool = pool_ptr;
+#[cfg(test)]
+mod tests {
+    use crate::{NanAlloc, alloc::pool::{ClassPool, ClassPoolList, MIN_POOL_CHUNK_SIZE}};
 
-        Some(())
-    } 
+    #[test]
+    fn test_class_pool() {
+
+        let alloc = NanAlloc::new();
+
+        let mut pool_list64 = ClassPoolList::new(64).unwrap();
+        let mut pool_list128 = ClassPoolList::new(128).unwrap();
+
+        // We cannot use 32 byte class pools in tests (because our word size can be larger than 32 bits), but this MUST work in wasm (because
+        // its address space is 32 bit wide).
+        ClassPoolList::new(32).unwrap();
+
+        // Only power of two sizes are allowed
+        assert!(ClassPoolList::new(63).is_none());
+
+        // We must respect the minimum pool chunk size
+        assert!(ClassPoolList::new(MIN_POOL_CHUNK_SIZE-1).is_none());
+
+
+    }
 }

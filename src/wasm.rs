@@ -19,6 +19,44 @@ pub const PAGE_SIZE: usize = 2usize.pow(16);
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) const TEST_MAX_HEAP_PAGES: usize = 512;
 
+/// A test heap handle for tests. It automatically allocates and deallocates test heap.
+#[cfg(not(target_arch = "wasm32"))]
+pub struct TestHeapHandle(Layout);
+
+#[cfg(not(target_arch = "wasm32"))]
+impl TestHeapHandle {
+    pub fn new() -> Self {
+        if TEST_BASE_MEMORY_PAGES.with(|p| p.get()) != 0 {
+            panic!("Already initialized heap");
+        }
+
+        // We're allocating one more page for our allocator state. This is a more of a fix to the fact that our
+        // allocator doesn't enforce any page limits. Ideally it expects the entire heap + a single heap for itself.
+        let layout = Layout::from_size_align((TEST_MAX_HEAP_PAGES+1)*PAGE_SIZE, PAGE_SIZE).unwrap();
+
+        // Allocate our heap pointer
+        let heap_ptr = unsafe { std::alloc::alloc(layout) };
+
+        // Make sure that our heap pointer is actually page aligned
+        assert_eq!(heap_ptr as usize % PAGE_SIZE, 0);
+
+        // Store the total amount of base pages
+        TEST_BASE_MEMORY_PAGES.with(|p| p.set((heap_ptr as usize) / PAGE_SIZE));
+
+        Self(layout)
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl Drop for TestHeapHandle {
+    fn drop(&mut self) {
+        // A cleanup procedure that should be called at the end of each test. Simply deallocates our pages
+        let ptr = TEST_BASE_MEMORY_PAGES.with(|p| p.get() * PAGE_SIZE) as *mut u8;
+
+        unsafe { std::alloc::dealloc(ptr, self.0); }
+    }
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 thread_local! {
     /// How many heap pages this environment has already given out
@@ -26,28 +64,6 @@ thread_local! {
 
     /// With how many pages this allocator starts
     static TEST_BASE_MEMORY_PAGES: Cell<usize> = Cell::new(0);
-}
-
-
-/// A one-time initialization procedure that initializes simulated heap
-#[cfg(not(target_arch = "wasm32"))]
-fn test_init_heap() {
-    if TEST_BASE_MEMORY_PAGES.with(|p| p.get()) != 0 {
-        return;
-    }
-
-    // Allocate our heap pointer
-    let heap_ptr = unsafe { std::alloc::alloc(
-        // We're allocating one more page for our allocator state. This is a more of a fix to the fact that our
-        // allocator doesn't enforce any page limits. Ideally it expects the entire heap + a single heap for itself.
-        Layout::from_size_align((TEST_MAX_HEAP_PAGES+1)*PAGE_SIZE, PAGE_SIZE).unwrap()
-    )};
-
-    // Make sure that our heap pointer is actually page aligned
-    assert_eq!(heap_ptr as usize % PAGE_SIZE, 0);
-
-    // Store the total amount of base pages
-    TEST_BASE_MEMORY_PAGES.with(|p| p.set((heap_ptr as usize) / PAGE_SIZE));
 }
 
 /// Get the total amount of allocated pages
@@ -60,10 +76,10 @@ pub fn memory_size() -> usize {
     
     #[cfg(not(target_arch = "wasm32"))]
     {
-        test_init_heap();
-
         let base_pages = TEST_BASE_MEMORY_PAGES.with(|p| p.get());
         let heap_pages = TEST_HEAP_MEMORY_PAGES.with(|p| p.get());
+
+        assert_ne!(base_pages, 0, "Unitialized test heap");
 
         return base_pages+heap_pages;
     }
@@ -85,10 +101,10 @@ pub fn memory_grow(pages: usize) -> Option<usize> {
 
     #[cfg(not(target_arch = "wasm32"))]
     {
-        test_init_heap();
-
         let base_pages = TEST_BASE_MEMORY_PAGES.with(|p| p.get());
         let heap_pages = TEST_HEAP_MEMORY_PAGES.with(|p| p.get());
+
+        assert_ne!(base_pages, 0, "Unitialized test heap");
 
         // Don't exceed our limits
         if (heap_pages+pages) > TEST_MAX_HEAP_PAGES {
