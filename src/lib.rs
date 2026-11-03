@@ -3,10 +3,10 @@
 #[cfg(not(target_arch = "wasm32"))]
 extern crate std;
 
-mod wasm;
+mod alloc;
 mod buddytree;
 mod util;
-mod alloc;
+mod wasm;
 
 pub use alloc::NanAlloc;
 

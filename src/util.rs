@@ -1,13 +1,13 @@
-pub struct FixedStack<T: Copy, const S: usize,> {
+pub struct FixedStack<T: Copy, const S: usize> {
     values: [T; S],
-    len: usize
+    len: usize,
 }
 
 impl<T: Copy, const S: usize> FixedStack<T, S> {
     pub fn new(init: T) -> Self {
         Self {
             values: [init; S],
-            len: 0
+            len: 0,
         }
     }
 
@@ -29,7 +29,7 @@ impl<T: Copy, const S: usize> FixedStack<T, S> {
     pub fn pop(&mut self) -> Option<T> {
         if self.len > 0 {
             self.len -= 1;
-            
+
             self.values.get(self.len).copied()
         } else {
             None
