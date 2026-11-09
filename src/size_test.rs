@@ -22,3 +22,9 @@ pub unsafe extern "C" fn dealloc(ptr: *mut u8, size: usize, align: usize) {
         unsafe { ALLOC.dealloc(ptr, layout) };
     }
 }
+
+#[cfg(target_arch = "wasm32")]
+#[panic_handler]
+fn _panic_handler(_info: &core::panic::PanicInfo<'_>) -> ! {
+    loop {}
+}
