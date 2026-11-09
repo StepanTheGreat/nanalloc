@@ -1,6 +1,6 @@
 #![cfg_attr(target_arch = "wasm32", no_std)]
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(test, not(target_arch = "wasm32")))]
 extern crate std;
 
 mod alloc;
