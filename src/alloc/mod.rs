@@ -11,19 +11,11 @@
 //! simpler in implementation. Each node is represented as 2 bits (0 - all free, 1 - one free, 2 - none free), packed tightly into 32 bit integers.
 //! The first node entry is zeroed and ignored.  
 
-use core::{
-    alloc::GlobalAlloc,
-    cell::{Cell, OnceCell},
-    ptr,
-};
+use core::{alloc::GlobalAlloc, ptr};
+use crate::{alloc::{blocks::BlockAllocator, pool::ClassPoolList}, wasm::PAGE_SIZE};
 
-use crate::{
-    buddytree::{BuddyNode, BuddyTree, BuddyTreePage},
-    util::FixedStack,
-    wasm::{PAGE_SIZE, memory_grow, memory_size},
-};
-
-mod pool;
+pub mod blocks;
+pub mod pool;
 
 /// The total size of the heap. We're putting here a reasonable constant that both makes our implementation simple,
 const HEAP_SIZE: usize = 2usize.pow(30);
@@ -31,26 +23,11 @@ const HEAP_SIZE: usize = 2usize.pow(30);
 /// The size of a single allocatable memory block
 const BLOCK_SIZE: usize = PAGE_SIZE / 8;
 
-/// The total amount of blocks
-const TOTAL_BLOCKS: usize = HEAP_SIZE / BLOCK_SIZE;
-
-/// How many binary nodes in a tree. The total amount of lead nodes * 2 - 1
-const TOTAL_NODES: usize = TOTAL_BLOCKS * 2 - 1;
-
-/// The amount of bitsets we need to store. A single block takes 2 bits, since it needs in total 3 values.
-///
-/// The total amount
-const TOTAL_BLOCK_BITSETS: usize = (TOTAL_NODES * 2).div_ceil(BuddyTreePage::BITS as usize);
-
-/// We're using leading_zeros trick to constantly compute the total amount of layers.
-///
-/// Look for [layer_from_block_size] for a more detailed explanation
-const TOTAL_TREE_LAYERS: usize =
-    (BLOCK_SIZE.leading_zeros() - HEAP_SIZE.leading_zeros() + 1) as usize;
+const TOTAL_CLASS_POOLS: usize = 6;
 
 /// Check whether this pointer is block aligned
 pub fn is_block_aligned(ptr: *mut u8) -> bool {
-    ptr.align_offset(BLOCK_SIZE) == 0
+    (ptr.addr() % BLOCK_SIZE)  == 0
 }
 
 /// Get a block-aligned pointer from an arbitrary pointer
@@ -58,306 +35,104 @@ pub fn is_block_aligned(ptr: *mut u8) -> bool {
 /// # Safety
 /// For the same reason as [sub] on pointers.
 pub unsafe fn get_block_ptr(ptr: *mut u8) -> *mut u8 {
-    // How much to offset our pointer to make it block aligned
-    let offset = ptr.align_offset(BLOCK_SIZE);
+    // How much to offset our pointer to the left, to make it block aligned
+    let offset = ptr.addr() % BLOCK_SIZE;
 
     if offset > 0 {
-        // Move it to the left by an inverse step
-        unsafe { ptr.sub(BLOCK_SIZE - offset) }
+        // Move it to the left
+        unsafe { ptr.sub(offset) }
     } else {
         // In any case return it as it is
         ptr
     }
 }
 
-/// Get block's layer index in the tree from its size.
-///
-/// This will fail if:
-/// - The block is greater than our heap
-/// - The block is smaller than a single block size
-const fn layer_from_block_size(block: usize) -> Option<usize> {
-    let block = block.next_power_of_two();
+const LARGEST_CLASS_POOL_SIZE: usize = 2048;
 
-    if block < BLOCK_SIZE || block > HEAP_SIZE {
-        return None;
-    }
-
-    // The way we extract our layer is by counting the amount of leading zeros relative to our heap
-    // block. Because our blocks are powers of two, this offset translates naturally into layer index.
-    let heap_zeros = HEAP_SIZE.leading_zeros();
-    let block_zeros = block.leading_zeros();
-
-    Some((block_zeros - heap_zeros) as usize)
+/// Simply declares static allocator state. This macro exists solely to simplify static initialization for normal use and testing.
+macro_rules! declare_static_alloc_state {
+    () => {
+        static ALLOC_BLOCKS: BlockAllocator = BlockAllocator::new();
+        static ALLOC_POOLS: [ClassPoolList; TOTAL_CLASS_POOLS] = [
+            ClassPoolList::new(64),
+            ClassPoolList::new(128),
+            ClassPoolList::new(256),
+            ClassPoolList::new(512),
+            ClassPoolList::new(1024),
+            ClassPoolList::new(LARGEST_CLASS_POOL_SIZE),
+        ];
+    };
 }
 
-/// An ultra minimal allocator
-///
-/// Some properties and quirks:
-/// - Has a maximum heap size of 2^31 bytes
-/// - Allocates memory in blocks of 8192 bytes (1/8 of a single wasm page)
-/// - Only guarantees alignment for up to 8192 bytes (doesn't fail to allocate though).
+#[cfg(target_arch = "wasm32")]
+declare_static_alloc_state!();
+
+/// A tiny wasm32 allocator. 
+/// 
+/// Some of its properties:
+/// - Has a heap limit of 1GB or 2^30
+/// - Guarantees alignment up to 8KB or 2^13 (beyond that returns null)
+/// - Has 7 classes for tiny allocations (64, 128, 256, 512, 1024 and 2048)
+/// - Any allocation beyond those 7 classes automatically uses full block allocation. A single block is ALWAYS 8KB minimum.
+/// - Not thread safe, expected to be used in threadless wasm
 pub struct NanAlloc {
-    /// The pointer to our block tree
-    block_tree: OnceCell<BuddyTree<TOTAL_BLOCK_BITSETS>>,
-
-    /// The pointer to our usable heap
-    heap_ptr: OnceCell<*mut u8>,
-
-    /// How many pages were already allocated
-    pages_allocated: Cell<usize>,
-
-    /// Was this allocator initialized? If not, it's unusable
-    initialized: Cell<bool>,
-}
-
-// No threading on wasm
-#[cfg(target_arch = "wasm32")]
-unsafe impl Sync for NanAlloc {}
-
-// Same thing
-#[cfg(target_arch = "wasm32")]
-unsafe impl Send for NanAlloc {}
-
-impl Default for NanAlloc {
-    fn default() -> Self {
-        Self::new()
-    }
+    blocks: &'static BlockAllocator,
+    pools: &'static [ClassPoolList]
 }
 
 impl NanAlloc {
+    #[cfg(target_arch = "wasm32")]
     pub const fn new() -> Self {
         Self {
-            block_tree: OnceCell::new(),
-            heap_ptr: OnceCell::new(),
-            pages_allocated: Cell::new(0),
-            initialized: Cell::new(false),
+            blocks: &ALLOC_BLOCKS,
+            pools: &ALLOC_POOLS
         }
     }
 
-    fn alloc_pages(&self, pages: usize) -> Option<*mut u8> {
-        if pages == 0 {
-            return None;
+    #[cfg(not(target_arch = "wasm32"))]
+    pub const fn from_state(blocks: &'static BlockAllocator, pools: &'static [ClassPoolList]) -> Self {
+        Self {
+            blocks,
+            pools
+        }
+    }
+
+    unsafe fn ex_alloc(&self, layout: core::alloc::Layout) -> *mut u8 {
+        if layout.align() > BLOCK_SIZE {
+            return ptr::null_mut();
         }
 
-        // Make a pointer to the edge
-        let ptr = (memory_size() * PAGE_SIZE) as *mut u8;
-
-        // If successful - return a pointer
-        match memory_grow(pages) {
-            None => None,
-            Some(_) => {
-                self.pages_allocated.set(self.pages_allocated.get() + pages);
-                Some(ptr)
+        let req_size = layout.size().max(layout.align());
+        
+        for pool in self.pools {
+            if req_size <= pool.chunk_size() {
+                return pool.take_chunk(self.blocks).unwrap_or(ptr::null_mut());
             }
         }
+
+        self.blocks.find_block(req_size).unwrap_or(ptr::null_mut())
     }
 
-    /// Initialize and return the status of initialization
-    fn initialize(&self) -> bool {
-        if self.initialized.get() {
-            return true;
+    unsafe fn ex_dealloc(&self, ptr: *mut u8, layout: core::alloc::Layout) {
+        if layout.align() > BLOCK_SIZE {
+            return;
         }
 
-        if let Some(block_tree_ptr) = self.alloc_pages(1) {
-            // Our usable heap starts one page to the right
-            let heap_ptr = unsafe { block_tree_ptr.add(PAGE_SIZE) };
-
-            let block_tree_ptr = block_tree_ptr as *mut u32;
-
-            // Initialize our block tree
-            let _ = self
-                .block_tree
-                .set(unsafe { BuddyTree::<TOTAL_BLOCK_BITSETS>::new(block_tree_ptr) });
-            let _ = self.heap_ptr.set(heap_ptr);
+        let req_size = layout.size().max(layout.align());
+        
+        if req_size <= LARGEST_CLASS_POOL_SIZE {
+            unsafe { ClassPoolList::free_chunk(self.blocks, ptr) };
         } else {
-            return false;
+            let _ = self.blocks.free_block(ptr, req_size);
         }
 
-        self.initialized.set(true);
-        true
-    }
-
-    /// Prealocate pages to satisfy a block request
-    unsafe fn preallocate_pages_for(&self, node_ind: usize, node_size: usize) -> Option<*mut u8> {
-        // Get our heap pointer
-        let heap_ptr: *mut u8 = self.heap_ptr.get().copied()?;
-
-        // How much to step from the heap to access our node
-        let node_offset = node_ind * node_size;
-
-        // Compute the required egde (node pointer + its size)
-        let required_end = (heap_ptr as usize + node_offset) + node_size;
-
-        // Compute the total allocated by us end
-        let allocated_end = heap_ptr as usize + self.pages_allocated.get() * PAGE_SIZE;
-
-        // Already satisfied
-        if required_end < allocated_end {
-            return Some(unsafe { heap_ptr.add(node_offset) });
-        }
-
-        // Compute the amount of pages we might need
-        let req_pages = (required_end - allocated_end).div_ceil(PAGE_SIZE);
-        if req_pages > 0 {
-            self.alloc_pages(req_pages)?;
-        }
-
-        Some(unsafe { heap_ptr.add(node_offset) })
-    }
-
-    /// Find a block that can satisfy the requested amount of bytes
-    #[inline]
-    fn find_block(&self, bytes: usize) -> Option<*mut u8> {
-        if !self.initialize() {
-            return None;
-        }
-
-        let po2_bytes = bytes.next_power_of_two().max(BLOCK_SIZE);
-
-        if po2_bytes > HEAP_SIZE {
-            return None;
-        }
-
-        let block_tree = self.block_tree.get()?;
-
-        // A stack of (parent ID, direction to process Some(left = true, false = false))
-        let mut node_stack: FixedStack<(usize, Option<bool>), TOTAL_TREE_LAYERS> =
-            FixedStack::new((0usize, Some(true)));
-
-        node_stack.push((0, Some(true)));
-
-        while let Some((node, to_process)) = node_stack.pop() {
-            // Whether we're processing left or right child
-            let process_left_child = if let Some(left_child) = to_process {
-                left_child
-            } else {
-                continue;
-            };
-
-            // Get the layer of this node in the tree
-            let layer = block_tree.layer(node)?;
-            let layer_ind = block_tree.layer_ind(node)?;
-
-            // The total size of this node
-            let node_size = 2usize.pow(30 - layer as u32);
-
-            match block_tree.get(node)? {
-                BuddyNode::Full => continue,
-                BuddyNode::Partial => {}
-                BuddyNode::Free => {
-                    // We found the perfect block
-                    if node_size == po2_bytes {
-                        // Let's try to preallocate pages for it first. If this operation fails - we cannot procede further.
-                        let node_ptr = unsafe { self.preallocate_pages_for(layer_ind, node_size)? };
-                        block_tree.occupy(node);
-                        return Some(node_ptr);
-                    }
-                }
-            }
-
-            // Useless afterwards, we need our specific node size
-            if node_size < po2_bytes {
-                continue;
-            }
-
-            // If we have children - let's push them
-            if let Some((lchild, rchild)) = block_tree.children(node) {
-                // Which child to push
-                let child_to_push = if process_left_child { lchild } else { rchild };
-
-                // Push ourselves once more, but now for the right child
-                node_stack.push((
-                    node,
-                    if process_left_child {
-                        Some(false)
-                    } else {
-                        None
-                    },
-                ));
-
-                // Push our child
-                node_stack.push((child_to_push, Some(true)));
-            }
-        }
-
-        // In any other case we cannot satisfy the request
-        None
-    }
-
-    /// Try free the provided block of bytes
-    #[inline]
-    fn free_block(&self, ptr: *mut u8, bytes: usize) -> Option<()> {
-        if !self.initialize() {
-            return None;
-        }
-
-        let po2_bytes = bytes.next_power_of_two().max(BLOCK_SIZE);
-
-        if po2_bytes > HEAP_SIZE {
-            // We couldn't possibly allocate more than our heap
-            return None;
-        }
-
-        let heap_start = self.heap_ptr.get().copied()?;
-
-        if ptr < heap_start {
-            // Our block start earlier than our heap????
-            return None;
-        }
-
-        let block_tree = self.block_tree.get()?;
-
-        // Compute the block index in its tree layer
-        let block_ind = ((ptr as usize) - (heap_start as usize)) / po2_bytes;
-
-        // Try extract this block's layer from its block size
-        let block_layer = layer_from_block_size(po2_bytes)?;
-
-        // Map it to actual coordinates
-        let node_to_free = block_tree.node_from_local(block_layer, block_ind)?;
-
-        // If it's actually full - free it
-        if block_tree.get(node_to_free)? == BuddyNode::Full {
-            block_tree.free(node_to_free);
-            return Some(());
-        }
-
-        // In any other case do nothing
-        None
-    }
-
-    #[inline]
-    pub(crate) unsafe fn ex_alloc(&self, layout: core::alloc::Layout) -> Option<*mut u8> {
-        if layout.align() > BLOCK_SIZE {
-            // Our allocator only guarantees alignment up to 8KB
-            return None;
-        }
-
-        // Try find a block or return a null pointer
-        self.find_block(layout.size())
-    }
-
-    /// The only difference between [GlobalAlloc::dealloc] is that this returns [Option] that
-    /// signifies whether the deallocation was successful (only ever useful when testing)
-    #[inline]
-    pub(crate) unsafe fn ex_dealloc(
-        &self,
-        ptr: *mut u8,
-        layout: core::alloc::Layout,
-    ) -> Option<()> {
-        if layout.align() > BLOCK_SIZE {
-            // The same reason as for [alloc]
-            return None;
-        }
-
-        // Try free the pointer if possible
-        self.free_block(ptr, layout.size())
     }
 }
 
 unsafe impl GlobalAlloc for NanAlloc {
     unsafe fn alloc(&self, layout: core::alloc::Layout) -> *mut u8 {
-        unsafe { self.ex_alloc(layout).unwrap_or(ptr::null_mut()) }
+        unsafe { self.ex_alloc(layout) }
+        
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: core::alloc::Layout) {
@@ -367,230 +142,163 @@ unsafe impl GlobalAlloc for NanAlloc {
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
-    use crate::{
-        NanAlloc,
-        alloc::BLOCK_SIZE,
-        wasm::{PAGE_SIZE, TEST_MAX_HEAP_PAGES, TestHeapHandle},
-    };
-    use core::{alloc::Layout, ptr};
+    use core::alloc::{GlobalAlloc, Layout};
 
-    /// Because we cannot sacrifice 1GB of RAM for our tests
+    use crate::alloc::{BLOCK_SIZE, NanAlloc};
+    use crate::alloc::{blocks::BlockAllocator, pool::ClassPoolList};
+    use crate::wasm::{PAGE_SIZE, TEST_MAX_HEAP_PAGES, TestHeapHandle};
+    use super::{TOTAL_CLASS_POOLS, LARGEST_CLASS_POOL_SIZE};
+
     const LOCAL_HEAP_SIZE: usize = TEST_MAX_HEAP_PAGES * PAGE_SIZE;
 
     const LOCAL_TOTAL_BLOCKS: usize = LOCAL_HEAP_SIZE / BLOCK_SIZE;
 
-    /// How many local tree layers we got
-    const LOCAL_TOTAL_TREE_LAYERS: usize =
-        (BLOCK_SIZE.leading_zeros() - LOCAL_HEAP_SIZE.leading_zeros() + 1) as usize;
+    // No threads in wasm
+    unsafe impl Send for BlockAllocator {}
+    unsafe impl Sync for BlockAllocator {}
 
-    thread_local! {
-        static ALLOC: NanAlloc = NanAlloc::new();
+    fn make_layout(size: usize, align: usize) -> Layout {
+        Layout::from_size_align(size, align).unwrap()
     }
 
-    unsafe fn alloc(size: usize, align: usize) -> Option<*mut u8> {
-        unsafe { ALLOC.with(|a| a.ex_alloc(Layout::from_size_align(size, align).unwrap())) }
-    }
-
-    unsafe fn dealloc(ptr: *mut u8, size: usize, align: usize) -> Option<()> {
-        unsafe { ALLOC.with(|a| a.ex_dealloc(ptr, Layout::from_size_align(size, align).unwrap())) }
-    }
-
-    /// Test basic allocator functionality
     #[test]
-    #[cfg_attr(miri, ignore = "heavy for miri")]
     fn test_basic_alloc() {
+
+        declare_static_alloc_state!();
+        static ALLOC: NanAlloc = NanAlloc::from_state(&ALLOC_BLOCKS, &ALLOC_POOLS);
+
         let _heap = TestHeapHandle::new();
 
-        // We're going to allocate all of the blocks within our entire heap. Individually.
-        let mut block_ptrs = std::vec![(ptr::null_mut::<u8>(), 0); LOCAL_TOTAL_BLOCKS];
+        // Let's first check some properties
 
-        const ITER_COUNT: usize = 4;
+        // This will fail, since this block size is much greater than our available heap
+        assert!(unsafe { ALLOC.alloc(make_layout(LOCAL_HEAP_SIZE+1, BLOCK_SIZE))}.is_null() );
 
-        // This experiment is then repeated multiple times for stability.
-        for _ in 0..ITER_COUNT {
-            // Allocate EACH block from the heap
-            for bind in 0..LOCAL_TOTAL_BLOCKS {
-                // This pointer cannot be null!
-                block_ptrs[bind] = (unsafe { alloc(BLOCK_SIZE, 1) }.unwrap(), BLOCK_SIZE);
-            }
-
-            // We no longer have any more blocks
-            assert!(unsafe { alloc(BLOCK_SIZE, 1) }.is_none());
-
-            // Let's free all of them now
-            for bind in 0..LOCAL_TOTAL_BLOCKS {
-                unsafe { dealloc(block_ptrs[bind].0, block_ptrs[bind].1, 1) }.unwrap();
-            }
-
-            // Zero all our pointers
-            block_ptrs.fill((ptr::null_mut(), 0));
+        // This will succeed though
+        {
+            let ptr = unsafe { ALLOC.alloc(make_layout(LOCAL_HEAP_SIZE, BLOCK_SIZE))};
+            assert!(!ptr.is_null());
+            unsafe { ALLOC.dealloc(ptr, make_layout(LOCAL_HEAP_SIZE, BLOCK_SIZE))};
         }
 
-        // We'll take all blocks again
-        for bind in 0..LOCAL_TOTAL_BLOCKS {
-            // This pointer cannot be null!
-            block_ptrs[bind] = (unsafe { alloc(BLOCK_SIZE, 1) }.unwrap(), BLOCK_SIZE);
+        // Our allocator also cannot guarantee alignment beyond our block size
+        assert!(unsafe { ALLOC.alloc(make_layout(BLOCK_SIZE, BLOCK_SIZE*2))}.is_null() );
+
+        // But this will of course work
+        {
+            let ptr = unsafe { ALLOC.alloc(make_layout(BLOCK_SIZE, BLOCK_SIZE))};
+            assert!(!ptr.is_null());
+            unsafe { ALLOC.dealloc(ptr, make_layout(BLOCK_SIZE, BLOCK_SIZE))};
         }
 
-        // But this time we'll try to allocate one large block instead
-        assert!(unsafe { alloc(BLOCK_SIZE * 2, 1) }.is_none());
+        // Let's now allocate a few things.
 
-        // Free our previous two
-        unsafe { dealloc(block_ptrs[0].0, block_ptrs[0].1, 1).unwrap() };
-        unsafe { dealloc(block_ptrs[1].0, block_ptrs[1].1, 1).unwrap() };
+        let mut ptrs = Vec::new();
 
-        // Allocate one larger block instead
-        block_ptrs[0] = (ptr::null_mut(), 0);
-        block_ptrs[1] = (unsafe { alloc(BLOCK_SIZE * 2, 1) }.unwrap(), BLOCK_SIZE * 2);
+        for size in [64, 128, 256, 512, 1024, 2048, 8192] {
+            let layout = make_layout(size, 2);
+            let ptr = unsafe { ALLOC.alloc(layout) };
+            assert!(!ptr.is_null());
 
-        // Memory is still perfectly taken
-        assert!(unsafe { alloc(BLOCK_SIZE * 2, 1) }.is_none());
+            ptrs.push((ptr, layout));
+        }
 
-        // Deallocate all our blocks again
-        for bind in 0..LOCAL_TOTAL_BLOCKS {
-            if !block_ptrs[bind].0.is_null() {
-                unsafe { dealloc(block_ptrs[bind].0, block_ptrs[bind].1, 1) }.unwrap();
+        // Now we'll perform much more precise tests, since we have direct knowledge of how the allocator works.
+        // As of now, only 7 blocks are allocated (6 of them are pools).
+
+        // We'll use the same miri-friendly trick from the pool tests
+        let mut reserved_blocks = Vec::new();
+        {
+            let mut total_blocks_left = LOCAL_TOTAL_BLOCKS;
+            while total_blocks_left > 8 {
+                let layout = make_layout(BLOCK_SIZE*total_blocks_left/2, 2);
+                let ptr = unsafe { ALLOC.alloc (layout) };
+
+                assert!(!ptr.is_null());
+
+                reserved_blocks.push((ptr, layout));
+                
+                total_blocks_left /= 2;
+            }
+
+            let layout = make_layout(BLOCK_SIZE, 2);
+            let ptr = unsafe { ALLOC.alloc (layout) };
+
+            assert!(!ptr.is_null());
+
+            reserved_blocks.push((ptr, layout));
+        }
+
+        // Right now, literally all heap blocks are taken, so it's impossible to allocate anything
+        assert!(unsafe { ALLOC.alloc (make_layout(BLOCK_SIZE, 2)) }.is_null());
+
+
+        // For each class, we're going to take all remaining chunks from its pool
+        for size in [64, 128, 256, 512, 1024, 2048] {
+
+            // How many chunks we can still allocate
+            let chunks_left = (BLOCK_SIZE / size - 1)-1;
+
+            for _ in 0..chunks_left {
+                let layout = make_layout(size, 2);
+                let ptr = unsafe { ALLOC.alloc(layout) };
+                assert!(!ptr.is_null());
+    
+                ptrs.push((ptr, layout));
             }
         }
 
-        block_ptrs.fill((ptr::null_mut(), 0));
-    }
+        // Even though all our blocks are taken, pools still have some free capacity that we were able to use.
 
-    /// Test various allocator properties
-    #[test]
-    fn test_alloc_props() {
-        let _heap = TestHeapHandle::new();
 
-        // Let's test alignment first
+        // Let's free ALL of our chunks and our one block
 
-        // The maximum allocatable amount is equal to our heap
-        assert!(unsafe { alloc(LOCAL_HEAP_SIZE + 1, BLOCK_SIZE * 2) }.is_none());
-
-        // This however will work perfectly fine
-        unsafe {
-            let ptr = alloc(LOCAL_HEAP_SIZE, BLOCK_SIZE).unwrap();
-            dealloc(ptr, LOCAL_HEAP_SIZE, BLOCK_SIZE).unwrap();
+        for (ptr, layout) in ptrs.drain(..) {
+            unsafe { ALLOC.dealloc(ptr, layout) };
         }
 
-        // Will fail, since our allocator only guarantees layout up to 8KB
-        assert!(unsafe { alloc(BLOCK_SIZE, BLOCK_SIZE * 2) }.is_none());
+        // As of now, 6 blocks are still allocated (pools always keep one pool worth of chunks always allocated), but our remaining 7th block no longer is.
 
-        // But when it's less or equal to block size = it's fine.
-        unsafe {
-            let ptr = alloc(BLOCK_SIZE, BLOCK_SIZE).unwrap();
-            dealloc(ptr, BLOCK_SIZE, BLOCK_SIZE).unwrap();
+        // Let's allocate two pools worth of chunks for a class of our choice
+
+        for _ in 0..(BLOCK_SIZE/64-1)*2 {
+            let layout = make_layout(64, 2);
+            let ptr = unsafe { ALLOC.alloc(layout) };
+            assert!(!ptr.is_null());
+
+            ptrs.push((ptr, layout));
         }
-    }
 
-    /// We're going to split our tree into two parts:
-    /// 1 will allocate from bottom to the top
-    /// 2 will allocate from top to the bottom
-    ///
-    /// The allocator should easily handle various sizes
-    #[test]
-    #[cfg_attr(miri, ignore = "heavy for miri")]
-    fn test_recursive_alloc() {
-        let _heap = TestHeapHandle::new();
+        // This in turn allocates the remaining 7th block back, but now for our 64 byte pool
 
-        let mut left = Vec::new();
-        let mut right = Vec::new();
+        // Still cannot allocate
+        assert!(unsafe { ALLOC.alloc (make_layout(64, 2)) }.is_null());
+        assert!(unsafe { ALLOC.alloc (make_layout(BLOCK_SIZE, 2)) }.is_null());
 
-        let mut layer_left = 0;
-        let mut layer_right = LOCAL_TOTAL_TREE_LAYERS as u32 - 2;
+        // Let's now free all our pointers and check if it frees back the 7th block
 
-        loop {
-            let block_size_left =
-                BLOCK_SIZE * 2usize.pow((LOCAL_TOTAL_TREE_LAYERS as u32 - 2) - layer_left);
-            let block_size_right =
-                BLOCK_SIZE * 2usize.pow((LOCAL_TOTAL_TREE_LAYERS as u32 - 2) - layer_right);
-
-            let blocks_left = (LOCAL_HEAP_SIZE / 2) / block_size_left;
-            let blocks_right = (LOCAL_HEAP_SIZE / 2) / block_size_right;
-
-            // Allocate the entire left part
-            for _ in 0..blocks_left {
-                left.push(unsafe { alloc(block_size_left, 1) }.unwrap());
-            }
-
-            // Right part
-            for _ in 0..blocks_right {
-                right.push(unsafe { alloc(block_size_right, 1) }.unwrap());
-            }
-
-            // Free everything on the left
-            while let Some(ptr_left) = left.pop() {
-                unsafe { dealloc(ptr_left, block_size_left, 1) }.unwrap();
-            }
-
-            // On the right as well
-            while let Some(ptr_right) = right.pop() {
-                unsafe { dealloc(ptr_right, block_size_right, 1) }.unwrap();
-            }
-
-            // Increment indices
-            if layer_right > 0 {
-                layer_right -= 1;
-                layer_left += 1;
-            } else {
-                break;
-            }
+        for (ptr, layout) in ptrs.drain(..) {
+            unsafe { ALLOC.dealloc(ptr, layout) };
         }
-    }
 
-    /// Test basic allocator functionality with miri
-    #[test]
-    fn test_basic_alloc_miri() {
-        let _heap = TestHeapHandle::new();
+        // Now this should succeed
+        {
+            let ptr = unsafe { ALLOC.alloc(make_layout(BLOCK_SIZE, 2)) };
+            assert!(!ptr.is_null());
+            unsafe { ALLOC.dealloc(ptr, make_layout(BLOCK_SIZE, 2));}
+        }
 
-        unsafe {
-            // 1/2 of our heap
-            let ptr1 = alloc(LOCAL_HEAP_SIZE / 2, BLOCK_SIZE).unwrap();
+        // Our final test will be about alignment. Our allocator should make sure that it allocates the greatest request (either based on size, or alignment)
 
-            // 1/4 of our heap
-            let ptr2 = alloc(LOCAL_HEAP_SIZE / 4, BLOCK_SIZE).unwrap();
+        {
+            // Request 2 bytes, but with a block size alignment
+            let ptr = unsafe { ALLOC.alloc(make_layout(2, BLOCK_SIZE)) };
+            assert!(!ptr.is_null());
 
-            // 1/8 of our heap
-            let ptr3 = alloc(LOCAL_HEAP_SIZE / 8, BLOCK_SIZE).unwrap();
+            // Because our alignment was block-size wide, we allocated an entire block back. Cannot allocate anything else now
+            assert!(unsafe { ALLOC.alloc (make_layout(BLOCK_SIZE, 2)) }.is_null());
 
-            // 1/8 of our heap
-            let ptr4 = alloc(LOCAL_HEAP_SIZE / 8, BLOCK_SIZE).unwrap();
-
-            // In total 1
-
-            // No more available blocks
-            assert!(alloc(BLOCK_SIZE, BLOCK_SIZE).is_none());
-
-            // Deallocate our last to pointers
-            dealloc(ptr3, LOCAL_HEAP_SIZE / 8, BLOCK_SIZE).unwrap();
-
-            dealloc(ptr4, LOCAL_HEAP_SIZE / 8, BLOCK_SIZE).unwrap();
-
-            // This should in turn free some place for an another quarter
-            let ptr3 = alloc(LOCAL_HEAP_SIZE / 4, BLOCK_SIZE).unwrap();
-
-            // Same situation
-            assert!(alloc(BLOCK_SIZE, BLOCK_SIZE).is_none());
-
-            // Free those again
-            dealloc(ptr2, LOCAL_HEAP_SIZE / 4, BLOCK_SIZE).unwrap();
-            dealloc(ptr3, LOCAL_HEAP_SIZE / 4, BLOCK_SIZE).unwrap();
-
-            // Now we can take the remaining half
-
-            let ptr2 = alloc(LOCAL_HEAP_SIZE / 2, BLOCK_SIZE).unwrap();
-
-            assert!(alloc(BLOCK_SIZE, BLOCK_SIZE).is_none());
-
-            // Free those
-            dealloc(ptr1, LOCAL_HEAP_SIZE / 2, BLOCK_SIZE).unwrap();
-            dealloc(ptr2, LOCAL_HEAP_SIZE / 2, BLOCK_SIZE).unwrap();
-
-            // And take the remaining heap!
-            let ptr1 = alloc(LOCAL_HEAP_SIZE, BLOCK_SIZE).unwrap();
-
-            assert!(alloc(BLOCK_SIZE, BLOCK_SIZE).is_none());
-
-            dealloc(ptr1, LOCAL_HEAP_SIZE, BLOCK_SIZE).unwrap();
+            unsafe { ALLOC.dealloc(ptr, make_layout(2, BLOCK_SIZE));}
         }
     }
 }

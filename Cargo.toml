@@ -16,7 +16,7 @@ panic = "abort"
 
 [profile.release]
 overflow-checks = false
-strip = false
+strip = true
 opt-level = "s"
 lto = true
 codegen-units = 1

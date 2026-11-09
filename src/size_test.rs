@@ -1,7 +1,7 @@
 use crate::NanAlloc;
 use core::{
     alloc::{GlobalAlloc, Layout},
-    ptr::ptr::null_mut,
+    ptr,
 };
 
 #[global_allocator]

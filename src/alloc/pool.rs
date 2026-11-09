@@ -1,8 +1,7 @@
 use core::{cell::Cell, ptr};
 
 use crate::{
-    NanAlloc,
-    alloc::{BLOCK_SIZE, get_block_ptr, is_block_aligned},
+    alloc::{BLOCK_SIZE, blocks::BlockAllocator, get_block_ptr, is_block_aligned},
 };
 
 /// The minimum size of a chunk within a pool. This requirement exists because
@@ -51,7 +50,7 @@ pub struct ClassPool {
 
 impl ClassPool {
     /// Allocate a new class pool from the provided pool list. Can fail if the allocator fails to find a block.
-    fn alloc(alloc: &NanAlloc, pool_list: &'static ClassPoolList) -> Option<*const Self> {
+    fn alloc(alloc: &BlockAllocator, pool_list: &'static ClassPoolList) -> Option<*const Self> {
         let block_ptr = alloc.find_block(BLOCK_SIZE)?;
 
         let pool_ptr = block_ptr as *mut ClassPool;
@@ -129,7 +128,7 @@ impl ClassPool {
     ///
     /// # Safety
     /// The passed chunk pointer is read as is it is, ONLY the pointer returned by the class pool can be passed back.
-    unsafe fn free_chunk(&self, alloc: &NanAlloc, chunk: *mut u8) {
+    unsafe fn free_chunk(&self, alloc: &BlockAllocator, chunk: *mut u8) {
         let was_pool_unlinked = !self.has_available_chunk();
 
         unsafe { (chunk as *mut *mut u8).write(self.next_chunk.get()) };
@@ -236,7 +235,7 @@ impl ClassPool {
     ///
     /// # Safety
     /// Similar to [unlink], only if the pool can be freed
-    unsafe fn unlink_free(&self, alloc: &NanAlloc) {
+    unsafe fn unlink_free(&self, alloc: &BlockAllocator) {
         unsafe { self.unlink() };
 
         // Decrement our list's total available chunks
@@ -294,8 +293,12 @@ impl ClassPoolList {
             .set(self.total_available_chunks.get() - by);
     }
 
+    pub fn chunk_size(&self) -> usize {
+        self.chunk_size
+    }
+
     /// Take a chunk if possible (can fail if the allocator cannot provide any more blocks)
-    pub fn take_chunk(&'static self, alloc: &NanAlloc) -> Option<*mut u8> {
+    pub fn take_chunk(&'static self, alloc: &BlockAllocator) -> Option<*mut u8> {
         unsafe {
             // If no pool is available - create a new one
             if self.root_pool.get().is_null() {
@@ -313,7 +316,7 @@ impl ClassPoolList {
     /// # Safety
     /// Only non-block aligned pointers can be freed as chunks. The reason: pool chunks are never block aliged, which is a good
     /// way to tell if a pointer is a pool or a block pointer.
-    pub unsafe fn free_chunk(alloc: &NanAlloc, chunk: *mut u8) {
+    pub unsafe fn free_chunk(alloc: &BlockAllocator, chunk: *mut u8) {
         if is_block_aligned(chunk) {
             return;
         }
@@ -328,11 +331,13 @@ impl ClassPoolList {
     }
 
     /// Check whether this class pool is empty (isn't currently linked to any pools)
+    #[cfg(all(test, not(target_arch = "wasm32")))]
     pub fn is_empty(&self) -> bool {
         self.root_pool.get().is_null()
     }
 
     /// How many available chunks this pool has in total
+    #[cfg(all(test, not(target_arch = "wasm32")))]
     pub fn available_chunks(&self) -> usize {
         self.total_available_chunks.get()
     }
@@ -346,12 +351,8 @@ unsafe impl Sync for ClassPoolList {}
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
-    use core::alloc::Layout;
-
     use crate::{
-        NanAlloc,
-        alloc::{BLOCK_SIZE, pool::ClassPoolList},
-        wasm::{PAGE_SIZE, TEST_MAX_HEAP_PAGES, TestHeapHandle},
+        alloc::{BLOCK_SIZE, blocks::BlockAllocator, pool::ClassPoolList}, wasm::{PAGE_SIZE, TEST_MAX_HEAP_PAGES, TestHeapHandle},
     };
 
     const LOCAL_HEAP_SIZE: usize = TEST_MAX_HEAP_PAGES * PAGE_SIZE;
@@ -367,7 +368,7 @@ mod tests {
     fn test_class_pool() {
         let _heap = TestHeapHandle::new();
 
-        let alloc = NanAlloc::new();
+        let alloc = BlockAllocator::new();
 
         const POOL_SIZE: usize = 64;
 
@@ -464,7 +465,7 @@ mod tests {
 
         let _heap = TestHeapHandle::new();
 
-        let alloc = NanAlloc::new();
+        let alloc = BlockAllocator::new();
 
         const POOL_SIZE: usize = 64;
 
@@ -472,37 +473,30 @@ mod tests {
         static POOL_LIST64: ClassPoolList = ClassPoolList::new(POOL_SIZE);
 
         // Remove and free all allocated pointers from the provided vector
-        fn free_all_chunks(chunks: &mut Vec<*mut u8>, alloc: &NanAlloc) {
+        fn free_all_chunks(chunks: &mut Vec<*mut u8>, alloc: &BlockAllocator) {
             for c in chunks.drain(..) {
                 unsafe { ClassPoolList::free_chunk(&alloc, c) };
             }
         }
 
         // Take all chunks and add them to the provided vector
-        fn take_all_chunks(chunks: &mut Vec<*mut u8>, alloc: &NanAlloc, available_chunks: usize) {
+        fn take_all_chunks(chunks: &mut Vec<*mut u8>, alloc: &BlockAllocator, available_chunks: usize) {
             for _ in 0..available_chunks {
                 chunks.push(POOL_LIST64.take_chunk(&alloc).unwrap());
             }
         }
 
-        unsafe fn alloc_blocks(alloc: &NanAlloc, blocks: usize) -> Option<*mut u8> {
+        unsafe fn alloc_blocks(alloc: &BlockAllocator, blocks: usize) -> Option<*mut u8> {
             assert!(blocks.is_power_of_two());
-            unsafe {
-                alloc.ex_alloc(Layout::from_size_align(blocks * BLOCK_SIZE, BLOCK_SIZE).unwrap())
-            }
+            alloc.find_block(blocks * BLOCK_SIZE)
         }
 
-        unsafe fn free_block(alloc: &NanAlloc, ptr: *mut u8) {
-            unsafe {
-                alloc.ex_dealloc(
-                    ptr,
-                    Layout::from_size_align(BLOCK_SIZE, BLOCK_SIZE).unwrap(),
-                );
-            }
+        unsafe fn free_block(alloc: &BlockAllocator, ptr: *mut u8) {
+            alloc.free_block(ptr, BLOCK_SIZE);
         }
 
         /// Test that this amount of blocks can be allocated
-        fn can_allocate_blocks(alloc: &NanAlloc, blocks: usize) -> bool {
+        fn can_allocate_blocks(alloc: &BlockAllocator, blocks: usize) -> bool {
             assert!(blocks.is_power_of_two());
 
             match unsafe { alloc_blocks(alloc, 1) } {
