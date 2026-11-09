@@ -72,8 +72,10 @@ impl ClassPool {
         // We'll be referring to it by pointer
         let this = pool_ptr;
 
+        let chunk_count = BLOCK_SIZE.checked_div(chunk_size).unwrap_or(1);
+
         // Build up a list of available chunks for it (starting from 1, because the first one contains our metadata)
-        for ind in 1..(BLOCK_SIZE / chunk_size) {
+        for ind in 1..chunk_count {
             unsafe { (*this).free_chunk(alloc, block_ptr.add(ind * chunk_size)) };
         }
 
@@ -84,7 +86,11 @@ impl ClassPool {
 
     /// How many chunks this pool can contain in total
     pub fn pool_chunk_capacity(&self) -> usize {
-        (BLOCK_SIZE / self.chunk_size()) - 1
+
+        // Rust isn't aware that our chunk size cannot ever be equal to 0, hence we must perform this obscure division
+        (
+            BLOCK_SIZE.checked_div(self.chunk_size()).unwrap_or(1)
+        ) - 1
     }
 
     pub fn chunk_size(&self) -> usize {
@@ -186,6 +192,7 @@ impl ClassPool {
     ///
     /// # Safety
     /// Should ONLY Be called when the pool was linked and it lost its final chunk
+    #[inline(never)]
     unsafe fn unlink(&self) {
         // We'll imagine the following setup (ptr2 is our pool):
         // <-- ptr1 <--> ptr2 <--> ptr3 -->
@@ -298,6 +305,7 @@ impl ClassPoolList {
     }
 
     /// Take a chunk if possible (can fail if the allocator cannot provide any more blocks)
+    #[inline(never)]
     pub fn take_chunk(&'static self, alloc: &BlockAllocator) -> Option<*mut u8> {
         unsafe {
             // If no pool is available - create a new one
@@ -316,6 +324,7 @@ impl ClassPoolList {
     /// # Safety
     /// Only non-block aligned pointers can be freed as chunks. The reason: pool chunks are never block aliged, which is a good
     /// way to tell if a pointer is a pool or a block pointer.
+    #[inline(never)]
     pub unsafe fn free_chunk(alloc: &BlockAllocator, chunk: *mut u8) {
         if is_block_aligned(chunk) {
             return;

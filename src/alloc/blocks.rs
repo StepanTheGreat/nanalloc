@@ -162,7 +162,7 @@ impl BlockAllocator {
     }
 
     /// Find a block that can satisfy the requested amount of bytes
-    #[inline]
+    #[inline(never)]
     pub fn find_block(&self, bytes: usize) -> Option<*mut u8> {
         if !self.initialize() {
             return None;
@@ -241,7 +241,7 @@ impl BlockAllocator {
     }
 
     /// Try free the provided block of bytes
-    #[inline]
+    #[inline(never)]
     pub fn free_block(&self, ptr: *mut u8, bytes: usize) -> Option<()> {
         if !self.initialize() {
             return None;
