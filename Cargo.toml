@@ -5,6 +5,7 @@ edition = "2024"
 
 [features]
 size_test = []
+test_runner = []
 default = []
 
 [lib]

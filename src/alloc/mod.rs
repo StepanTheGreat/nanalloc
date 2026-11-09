@@ -17,8 +17,10 @@ use crate::{alloc::{blocks::BlockAllocator, pool::ClassPoolList}, wasm::PAGE_SIZ
 pub mod blocks;
 pub mod pool;
 
+const HEAP_SIZE_BITS: u32 = 30;
+
 /// The total size of the heap. We're putting here a reasonable constant that both makes our implementation simple,
-const HEAP_SIZE: usize = 2usize.pow(30);
+const HEAP_SIZE: usize = 2usize.pow(HEAP_SIZE_BITS);
 
 /// The size of a single allocatable memory block
 const BLOCK_SIZE: usize = PAGE_SIZE / 8;
@@ -149,7 +151,7 @@ mod tests {
     use crate::wasm::{PAGE_SIZE, TEST_MAX_HEAP_PAGES, TestHeapHandle};
     use super::{TOTAL_CLASS_POOLS, LARGEST_CLASS_POOL_SIZE};
 
-    const LOCAL_HEAP_SIZE: usize = TEST_MAX_HEAP_PAGES * PAGE_SIZE;
+    const LOCAL_HEAP_SIZE: usize = (TEST_MAX_HEAP_PAGES-1) * PAGE_SIZE;
 
     const LOCAL_TOTAL_BLOCKS: usize = LOCAL_HEAP_SIZE / BLOCK_SIZE;
 

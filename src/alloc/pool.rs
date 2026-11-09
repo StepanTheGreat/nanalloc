@@ -364,7 +364,7 @@ mod tests {
         alloc::{BLOCK_SIZE, blocks::BlockAllocator, pool::ClassPoolList}, wasm::{PAGE_SIZE, TEST_MAX_HEAP_PAGES, TestHeapHandle},
     };
 
-    const LOCAL_HEAP_SIZE: usize = TEST_MAX_HEAP_PAGES * PAGE_SIZE;
+    const LOCAL_HEAP_SIZE: usize = (TEST_MAX_HEAP_PAGES-1) * PAGE_SIZE;
 
     const LOCAL_TOTAL_BLOCKS: usize = LOCAL_HEAP_SIZE / BLOCK_SIZE;
 

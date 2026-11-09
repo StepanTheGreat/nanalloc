@@ -14,7 +14,7 @@
 use core::cell::{Cell, OnceCell};
 
 use crate::{
-    alloc::{BLOCK_SIZE, HEAP_SIZE}, buddytree::{BuddyNode, BuddyTree, BuddyTreePage}, util::FixedStack, wasm::{PAGE_SIZE, memory_grow, memory_size},
+    alloc::{BLOCK_SIZE, HEAP_SIZE, HEAP_SIZE_BITS}, buddytree::{BuddyNode, BuddyTree, BuddyTreePage}, util::FixedStack, wasm::{PAGE_SIZE, memory_grow},
 };
 
 /// The total amount of blocks
@@ -95,14 +95,15 @@ impl BlockAllocator {
             return None;
         }
 
-        // Make a pointer to the edge
-        let ptr = (memory_size() * PAGE_SIZE) as *mut u8;
-
         // If successful - return a pointer
         match memory_grow(pages) {
             None => None,
-            Some(_) => {
+            Some(old_pages) => {
+                // Make a pointer to the edge
+                let ptr = (old_pages * PAGE_SIZE) as *mut u8;
+                
                 self.pages_allocated.set(self.pages_allocated.get() + pages);
+
                 Some(ptr)
             }
         }
@@ -118,13 +119,17 @@ impl BlockAllocator {
             // Our usable heap starts one page to the right
             let heap_ptr = unsafe { block_tree_ptr.add(PAGE_SIZE) };
 
-            let block_tree_ptr = block_tree_ptr as *mut u32;
+            let block_tree_ptr = block_tree_ptr as *mut BuddyTreePage;
 
             // Initialize our block tree
             let _ = self
                 .block_tree
                 .set(unsafe { BuddyTree::<TOTAL_BLOCK_BITSETS>::new(block_tree_ptr) });
             let _ = self.heap_ptr.set(heap_ptr);
+
+            // alloc_pages increments the total amount of allocated pages. Reset this number to zero ONCE.
+            self.pages_allocated.set(0);
+
         } else {
             return false;
         }
@@ -195,7 +200,7 @@ impl BlockAllocator {
             let layer_ind = block_tree.layer_ind(node)?;
 
             // The total size of this node
-            let node_size = 2usize.pow(30 - layer as u32);
+            let node_size = 2usize.pow(HEAP_SIZE_BITS - layer as u32);
 
             match block_tree.get(node)? {
                 BuddyNode::Full => continue,
@@ -296,7 +301,7 @@ mod tests {
     use core::ptr;
 
     /// Because we cannot sacrifice 1GB of RAM for our tests
-    const LOCAL_HEAP_SIZE: usize = TEST_MAX_HEAP_PAGES * PAGE_SIZE;
+    const LOCAL_HEAP_SIZE: usize = (TEST_MAX_HEAP_PAGES-1) * PAGE_SIZE;
 
     const LOCAL_TOTAL_BLOCKS: usize = LOCAL_HEAP_SIZE / BLOCK_SIZE;
 

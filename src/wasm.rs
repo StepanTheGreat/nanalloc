@@ -17,7 +17,7 @@ pub const PAGE_SIZE: usize = 2usize.pow(16);
 
 /// The total amount of heap pages the testing environment can allocate. An additional page is given exclusively for the tree itself
 #[cfg(not(target_arch = "wasm32"))]
-pub(crate) const TEST_MAX_HEAP_PAGES: usize = 512;
+pub(crate) const TEST_MAX_HEAP_PAGES: usize = 512+1;
 
 /// A test heap handle for tests. It automatically allocates and deallocates test heap.
 #[cfg(not(target_arch = "wasm32"))]
@@ -33,7 +33,7 @@ impl TestHeapHandle {
         // We're allocating one more page for our allocator state. This is a more of a fix to the fact that our
         // allocator doesn't enforce any page limits. Ideally it expects the entire heap + a single heap for itself.
         let layout =
-            Layout::from_size_align((TEST_MAX_HEAP_PAGES + 1) * PAGE_SIZE, PAGE_SIZE).unwrap();
+            Layout::from_size_align(TEST_MAX_HEAP_PAGES * PAGE_SIZE, PAGE_SIZE).unwrap();
 
         // Allocate our heap pointer
         let heap_ptr = unsafe { std::alloc::alloc(layout) };
@@ -72,8 +72,9 @@ thread_local! {
 /// Get the total amount of allocated pages
 ///
 /// Equivalent to `wasm32::memory_size`
-pub fn memory_size() -> usize {
+pub fn _memory_size() -> usize {
     #[cfg(target_arch = "wasm32")]
+
     return wasm32::memory_size::<WASM_MEM_INDEX>();
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -97,7 +98,7 @@ pub fn memory_grow(pages: usize) -> Option<usize> {
     {
         return match wasm32::memory_grow::<WASM_MEM_INDEX>(pages) {
             usize::MAX => None,
-            pages => Some(pages),
+            old_pages => Some(old_pages),
         };
     }
 
