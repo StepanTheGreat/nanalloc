@@ -21,8 +21,8 @@ tree where each node is a power of two block, combined from its two smallest chi
 This in turn means that: 
 - All blocks are powers of two (the leafs being 2^13 bytes long)
 - Blocks naturally reunite into larger blocks through propagation.
-- Finding blocks is O(log N), freeing is O(1)
-- When allocating tiny blocks (from class pools), allocation and deallocation is O(1) (almost. except for the rare occasions when a pool is out of memory)
+- Finding blocks is O(log N), freeing is O(log N) (propagation)
+- When allocating tiny blocks (from class pools), allocation and deallocation is O(1) (except for the rare occasions when a pool is out of memory)
 
 
 ### Limitations
